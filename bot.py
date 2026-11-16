@@ -234,4 +234,4 @@ async def callback_extract_audio(callback: types.CallbackQuery):
         if os.path.exists(out_mp3):
             await callback.message.answer_audio(
                 FSInputFile(out_mp3),
-                caption=t["caption_aud"] 
+                caption=t["caption_aud"]
