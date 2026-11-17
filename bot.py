@@ -96,11 +96,11 @@ async def download_media(message: types.Message):
         'quiet': True
     }
     
-    # Video tagida chiqadigan 2 ta tugma
+    # Video tagida chiqadigan 2 ta tugma (Music va Round)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🎵 Musiqani ajratish", callback_data="extract_audio"),
-            InlineKeyboardButton(text="🎥 Dumaloq video", callback_data="make_round")
+            InlineKeyboardButton(text="🎵 Music", callback_data="extract_audio"),
+            InlineKeyboardButton(text="🎥 Round", callback_data="make_round")
         ]
     ])
     
@@ -123,7 +123,7 @@ async def download_media(message: types.Message):
         await wait_msg.delete()
         if os.path.exists(filename): os.remove(filename)
 
-# Video tagidagi "🎵 Musiqani ajratish" tugmasi bosilganda
+# Video tagidagi "🎵 Music" tugmasi bosilganda
 @dp.callback_query(F.data == "extract_audio")
 async def callback_extract_audio(callback: types.CallbackQuery):
     await callback.answer("⏳ Musiqa ajratilmoqda...")
@@ -156,7 +156,7 @@ async def callback_extract_audio(callback: types.CallbackQuery):
         if os.path.exists(in_vid): os.remove(in_vid)
         if os.path.exists(out_mp3): os.remove(out_mp3)
 
-# Video tagidagi "🎥 Dumaloq video" tugmasi bosilganda
+# Video tagidagi "🎥 Round" tugmasi bosilganda
 @dp.callback_query(F.data == "make_round")
 async def callback_make_round(callback: types.CallbackQuery):
     await callback.answer("⏳ Dumaloq video tayyorlanmoqda...")
