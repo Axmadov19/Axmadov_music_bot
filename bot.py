@@ -41,7 +41,8 @@ T = {
     }
 }
 
-def gt(uid): return T.get(langs.get(uid, "uz"), T["uz"])
+def gt(uid):
+    return T.get(langs.get(uid, "uz"), T["uz"])
 
 def to_round(inp, outp):
     subprocess.run([FFMPEG, "-y", "-i", inp, "-t", "60", "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=384:384", "-c:v", "libx264", "-crf", "26", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", outp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -50,50 +51,52 @@ def to_mp3(inp, outp):
     subprocess.run([FFMPEG, "-y", "-i", inp, "-vn", "-ab", "192k", "-ar", "44100", outp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def dl_mp3(q, base):
-    opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f"{base}.%(ext)s",
-        'default_search': 'scsearch1',
-        'noplaylist': True,
-        'quiet': True
-    }
+    opts = {'format': 'bestaudio/best', 'outtmpl': f"{base}.%(ext)s", 'default_search': 'scsearch1', 'noplaylist': True, 'quiet': True}
     title = q
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(q, download=True)
         if 'entries' in info and info['entries']:
-            title = info['entries'].get('title', q)
+            title = info['entries'][0].get('title', q)
         else:
             title = info.get('title', q)
-            
     files = glob.glob(f"{base}.*")
     if files:
-        raw_file = files
+        raw_file = files[0]
         final_mp3 = f"{base}_ready.mp3"
         to_mp3(raw_file, final_mp3)
-        if os.path.exists(raw_file): os.remove(raw_file)
+        if os.path.exists(raw_file):
+            os.remove(raw_file)
         return title, final_mp3
     return title, ""
 
 @dp.message(Command("start"))
-async def c_start(m: types.Message): await m.answer(gt(m.from_user.id)["start"], parse_mode="Markdown")
+async def c_start(m: types.Message):
+    await m.answer(gt(m.from_user.id)["start"], parse_mode="Markdown")
 
 @dp.message(Command("music"))
-async def c_music(m: types.Message): await m.answer(gt(m.from_user.id)["music"])
+async def c_music(m: types.Message):
+    await m.answer(gt(m.from_user.id)["music"])
 
 @dp.message(Command("video"))
-async def c_video(m: types.Message): await m.answer(gt(m.from_user.id)["video"])
+async def c_video(m: types.Message):
+    await m.answer(gt(m.from_user.id)["video"])
 
 @dp.message(Command("help"))
-async def c_help(m: types.Message): await m.answer(gt(m.from_user.id)["help"], parse_mode="Markdown")
+async def c_help(m: types.Message):
+    await m.answer(gt(m.from_user.id)["help"], parse_mode="Markdown")
 
 @dp.message(Command("lang"))
 async def c_lang(m: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🇺🇿 O'zbek", callback_data="l_uz"), InlineKeyboardButton(text="🇷🇺 Русский", callback_data="l_ru"), InlineKeyboardButton(text="🇬🇧 English", callback_data="l_en")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🇺🇿 O'zbek", callback_data="l_uz"),
+        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="l_ru"),
+        InlineKeyboardButton(text="🇬🇧 English", callback_data="l_en")
+    ]])
     await m.answer(gt(m.from_user.id)["lang"], reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("l_"))
 async def cb_lang(c: types.CallbackQuery):
-    langs[c.from_user.id] = c.data.split("_")
+    langs[c.from_user.id] = c.data.split("_")[-1]
     await c.answer()
     await c.message.edit_text(gt(c.from_user.id)["set"], parse_mode="Markdown")
 
@@ -101,8 +104,7 @@ async def cb_lang(c: types.CallbackQuery):
 async def h_voice(m: types.Message):
     t = gt(m.from_user.id)
     w = await m.answer(t["wait"])
-    inp, base = f"v_{m.message_id}.ogg", f"f_{m.message_id}"
-    outp = ""
+    inp, base, outp = f"v_{m.message_id}.ogg", f"f_{m.message_id}", ""
     try:
         f = await bot.get_file((m.voice or m.audio).file_id)
         await bot.download_file(f.file_path, inp)
@@ -118,13 +120,17 @@ async def h_voice(m: types.Message):
             title, outp = await asyncio.to_thread(dl_mp3, title, base)
             if outp and os.path.exists(outp):
                 await m.answer_audio(FSInputFile(outp), title=title, caption=f"🎶 {title}\n{t['cap_a']}")
-            else: await m.answer(t["err"])
-        else: await m.answer(t["not_found"])
-    except Exception: await m.answer(t["not_found"])
+            else:
+                await m.answer(t["err"])
+        else:
+            await m.answer(t["not_found"])
+    except Exception:
+        await m.answer(t["not_found"])
     finally:
         await w.delete()
         for x in (inp, outp):
-            if x and os.path.exists(x): os.remove(x)
+            if x and os.path.exists(x):
+                os.remove(x)
 
 @dp.message(F.video)
 async def h_vid(m: types.Message):
@@ -135,52 +141,67 @@ async def h_vid(m: types.Message):
         f = await bot.get_file(m.video.file_id)
         await bot.download_file(f.file_path, inp)
         await asyncio.to_thread(to_round, inp, outp)
-        if os.path.exists(outp): await m.answer_video_note(FSInputFile(outp))
-        else: await m.answer(t["err"])
-    except Exception: await m.answer(t["err"])
+        if os.path.exists(outp):
+            await m.answer_video_note(FSInputFile(outp))
+        else:
+            await m.answer(t["err"])
+    except Exception:
+        await m.answer(t["err"])
     finally:
         await w.delete()
         for x in (inp, outp):
-            if os.path.exists(x): os.remove(x)
+            if os.path.exists(x):
+                os.remove(x)
 
 @dp.message(F.text.contains("http"))
 async def h_link(m: types.Message):
     t = gt(m.from_user.id)
     w = await m.answer(t["wait"])
     fn = f"d_{m.message_id}.mp4"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎵 Music", callback_data="c_aud"), InlineKeyboardButton(text="🎥 Round", callback_data="c_rnd")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎵 Music", callback_data="c_aud"),
+        InlineKeyboardButton(text="🎥 Round", callback_data="c_rnd")
+    ]])
     try:
         def dl():
-            with yt_dlp.YoutubeDL({'format': 'best[ext=mp4]/best', 'outtmpl': fn, 'max_filesize': 48*1024*1024, 'quiet': True}) as y: y.download([m.text.strip()])
+            with yt_dlp.YoutubeDL({'format': 'best[ext=mp4]/best', 'outtmpl': fn, 'max_filesize': 48*1024*1024, 'quiet': True}) as y:
+                y.download([m.text.strip()])
         await asyncio.to_thread(dl)
-        if os.path.exists(fn): await m.answer_video(FSInputFile(fn), caption=t["cap_v"], reply_markup=kb)
-        else: await m.answer(t["err"])
-    except Exception: await m.answer(t["err"])
+        if os.path.exists(fn):
+            await m.answer_video(FSInputFile(fn), caption=t["cap_v"], reply_markup=kb)
+        else:
+            await m.answer(t["err"])
+    except Exception:
+        await m.answer(t["err"])
     finally:
         await w.delete()
-        if os.path.exists(fn): os.remove(fn)
+        if os.path.exists(fn):
+            os.remove(fn)
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def h_text(m: types.Message):
     t = gt(m.from_user.id)
     w = await m.answer(t["wait"])
-    base = f"s_{m.message_id}"
-    outp = ""
+    base, outp = f"s_{m.message_id}", ""
     try:
         title, outp = await asyncio.to_thread(dl_mp3, m.text.strip(), base)
         if outp and os.path.exists(outp):
             await m.answer_audio(FSInputFile(outp), title=title, caption=f"🎶 {title}\n{t['cap_a']}")
-        else: await m.answer(t["err"])
-    except Exception: await m.answer(t["err"])
+        else:
+            await m.answer(t["err"])
+    except Exception:
+        await m.answer(t["err"])
     finally:
         await w.delete()
-        if outp and os.path.exists(outp): os.remove(outp)
+        if outp and os.path.exists(outp):
+            os.remove(outp)
 
 @dp.callback_query(F.data.in_({"c_aud", "c_rnd"}))
 async def cb_media(c: types.CallbackQuery):
     t = gt(c.from_user.id)
     await c.answer()
-    if not c.message.video: return
+    if not c.message.video:
+        return
     w = await c.message.answer(t["wait"])
     inp = f"ci_{c.id}.mp4"
     outp = f"co_{c.id}.mp3" if c.data == "c_aud" else f"co_{c.id}.mp4"
@@ -189,25 +210,24 @@ async def cb_media(c: types.CallbackQuery):
         await bot.download_file(f.file_path, inp)
         await asyncio.to_thread(to_mp3 if c.data == "c_aud" else to_round, inp, outp)
         if os.path.exists(outp):
-            if c.data == "c_aud": await c.message.answer_audio(FSInputFile(outp), caption=t["cap_a"])
-            else: await c.message.answer_video_note(FSInputFile(outp))
-        else: await c.message.answer(t["err"])
-    except Exception: await c.message.answer(t["err"])
+            if c.data == "c_aud":
+                await c.message.answer_audio(FSInputFile(outp), caption=t["cap_a"])
+            else:
+                await c.message.answer_video_note(FSInputFile(outp))
+        else:
+            await c.message.answer(t["err"])
+    except Exception:
+        await c.message.answer(t["err"])
     finally:
         await w.delete()
         for x in (inp, outp):
-            if os.path.exists(x): os.remove(x)
+            if os.path.exists(x):
+                os.remove(x)
 
-async def handle(r): return web.Response(text="Live 24/7")
+async def handle(r):
+    return web.Response(text="Live 24/7")
+
 async def loop():
     await asyncio.sleep(3)
     while True:
         try:
-            await bot.delete_webhook(drop_pending_updates=True)
-            await dp.start_polling(bot, handle_signals=False)
-        except Exception: await asyncio.sleep(5)
-
-async def start_bg(app): asyncio.create_task(loop())
-
-if __name__ == "__main__":
-    app = web.Application()
