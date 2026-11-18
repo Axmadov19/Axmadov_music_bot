@@ -3,7 +3,7 @@ import os
 import re
 import asyncio
 import logging
-import subprocess
+import tempfile
 import unicodedata
 from pathlib import Path
 
@@ -22,17 +22,21 @@ import yt_dlp
 
 
 # ==========================================
-# SOZLAMALAR
+# 1. SOZLAMALAR
 # ==========================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AUDD_TOKEN = os.getenv("AUDD_TOKEN")
+
 PORT = int(os.getenv("PORT", "8080"))
 
 MUSIC_LIBRARY_DIR = Path("music_library")
 
 MAX_VIDEO_BYTES = 48 * 1024 * 1024
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
+
+MAX_SEARCH_RESULTS = 10
+MAX_STORED_SEARCHES = 1000
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi!")
@@ -41,6 +45,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -55,14 +61,15 @@ AUDIO_EXTENSIONS = {
 
 
 # ==========================================
-# TILLAR
+# 2. TILLAR
 # ==========================================
 
 TEXTS = {
     "uz": {
         "start": (
             "👋 Assalomu alaykum!\n\n"
-            "🎵 Qo'shiq nomini yozing yoki ovozli parcha yuboring.\n"
+            "🎵 Qo'shiq nomini yozing.\n"
+            "🎧 Ovozli parcha yuboring.\n"
             "🎬 Video havolasini yuboring.\n"
             "🎥 Video yuborsangiz, dumaloq video qilib beraman.\n\n"
             "/music - Musiqa\n"
@@ -73,20 +80,34 @@ TEXTS = {
         "wait": "⏳ Kuting...",
         "recognizing": "🎧 Qo'shiq aniqlanmoqda...",
         "not_found": "😔 Qo'shiq topilmadi.",
-        "not_library": (
-            "Qo'shiq aniqlandi, lekin to'liq audio "
-            "ruxsatli kutubxonamizda mavjud emas:"
+        "no_library": (
+            "😔 Bu qo'shiqning to'liq MP3 fayli "
+            "kutubxonamizda mavjud emas."
         ),
         "error": "❌ Xatolik yuz berdi.",
         "no_audd": "AudD token sozlanmagan.",
-        "no_song": "Qo'shiq topilmadi.",
-        "language": "Tilni tanlang:"
+        "too_large": "❌ Audio fayl juda katta.",
+        "language": "Tilni tanlang:",
+        "selected": "⏳ Qo'shiq qidirilmoqda...",
+        "expired": "Qidiruv natijasi eskirgan. Qayta qidiring.",
+        "video_ready": "📥 Video tayyor!",
+        "help": (
+            "ℹ️ Yordam:\n\n"
+            "1. Qo'shiq nomini yozing.\n"
+            "2. 1–10 raqamidan birini tanlang.\n"
+            "3. Video havolasini yuboring.\n"
+            "4. Videodan MP3 ajrating.\n"
+            "5. Video yuborib dumaloq video oling.\n"
+            "6. /lang orqali tilni o'zgartiring."
+        )
     },
 
     "ru": {
         "start": (
             "👋 Добро пожаловать!\n\n"
-            "Отправьте название песни, аудио или ссылку на видео.\n"
+            "🎵 Отправьте название песни.\n"
+            "🎧 Отправьте аудио.\n"
+            "🎬 Отправьте ссылку на видео.\n\n"
             "/music - Музыка\n"
             "/video - Видео\n"
             "/help - Помощь\n"
@@ -95,17 +116,31 @@ TEXTS = {
         "wait": "⏳ Подождите...",
         "recognizing": "🎧 Определяю песню...",
         "not_found": "😔 Песня не найдена.",
-        "not_library": "Песня определена, но аудио нет в библиотеке:",
+        "no_library": "😔 Полной MP3-версии нет в библиотеке.",
         "error": "❌ Произошла ошибка.",
         "no_audd": "AudD token не настроен.",
-        "no_song": "Песня не найдена.",
-        "language": "Выберите язык:"
+        "too_large": "❌ Аудиофайл слишком большой.",
+        "language": "Выберите язык:",
+        "selected": "⏳ Ищу песню...",
+        "expired": "Результаты устарели. Выполните поиск снова.",
+        "video_ready": "📥 Видео готово!",
+        "help": (
+            "ℹ️ Помощь:\n\n"
+            "1. Отправьте название песни.\n"
+            "2. Выберите номер от 1 до 10.\n"
+            "3. Отправьте ссылку на видео.\n"
+            "4. Извлеките MP3 из видео.\n"
+            "5. Отправьте видео для создания круглого видео.\n"
+            "6. /lang - изменить язык."
+        )
     },
 
     "en": {
         "start": (
             "👋 Welcome!\n\n"
-            "Send a song title, audio snippet or video link.\n"
+            "🎵 Send a song title.\n"
+            "🎧 Send an audio snippet.\n"
+            "🎬 Send a video link.\n\n"
             "/music - Music\n"
             "/video - Video\n"
             "/help - Help\n"
@@ -114,11 +149,23 @@ TEXTS = {
         "wait": "⏳ Please wait...",
         "recognizing": "🎧 Identifying song...",
         "not_found": "😔 Song not found.",
-        "not_library": "Song identified, but audio is not in our library:",
+        "no_library": "😔 Full MP3 is not available in the library.",
         "error": "❌ An error occurred.",
         "no_audd": "AudD token is not configured.",
-        "no_song": "Song not found.",
-        "language": "Choose language:"
+        "too_large": "❌ Audio file is too large.",
+        "language": "Choose a language:",
+        "selected": "⏳ Searching for song...",
+        "expired": "Search results expired. Please search again.",
+        "video_ready": "📥 Video is ready!",
+        "help": (
+            "ℹ️ Help:\n\n"
+            "1. Send a song title.\n"
+            "2. Select a number from 1 to 10.\n"
+            "3. Send a video link.\n"
+            "4. Extract MP3 from a video.\n"
+            "5. Send a video to create a round video.\n"
+            "6. /lang - Change language."
+        )
     }
 }
 
@@ -129,11 +176,14 @@ def get_text(user_id):
 
 
 # ==========================================
-# YORDAMCHI FUNKSIYALAR
+# 3. YORDAMCHI FUNKSIYALAR
 # ==========================================
 
 def normalize(text):
-    text = unicodedata.normalize("NFKD", text).casefold()
+    text = unicodedata.normalize(
+        "NFKD",
+        str(text)
+    ).casefold()
 
     text = "".join(
         char for char in text
@@ -141,7 +191,7 @@ def normalize(text):
     )
 
     return re.sub(
-        r"[^a-z0-9а-яё]+",
+        r"[^a-z0-9а-яёёўқғҳ]+",
         " ",
         text
     ).strip()
@@ -156,7 +206,13 @@ def find_song(query):
     if not query:
         return None
 
+    query_words = set(query.split())
+
+    best_file = None
+    best_score = 0
+
     for file in MUSIC_LIBRARY_DIR.rglob("*"):
+
         if not file.is_file():
             continue
 
@@ -165,19 +221,48 @@ def find_song(query):
 
         filename = normalize(file.stem)
 
-        if query in filename or filename in query:
+        if filename == query:
             return file
+
+        filename_words = set(filename.split())
+
+        common = query_words & filename_words
+
+        if not common:
+            continue
+
+        score = (
+            len(common) /
+            max(len(query_words), len(filename_words))
+        )
+
+        if query in filename:
+            score += 0.5
+
+        if score > best_score:
+            best_score = score
+            best_file = file
+
+    if best_score >= 0.5:
+        return best_file
 
     return None
 
 
 async def send_song(message, title, artist=""):
-    query = f"{artist} {title}".strip()
 
-    file = find_song(query)
+    queries = [
+        f"{artist} {title}".strip(),
+        title
+    ]
 
-    if not file:
-        file = find_song(title)
+    file = None
+
+    for query in queries:
+        file = find_song(query)
+
+        if file:
+            break
 
     if not file:
         return False
@@ -191,8 +276,29 @@ async def send_song(message, title, artist=""):
     return True
 
 
+def format_duration(milliseconds):
+    if not milliseconds:
+        return "?:??"
+
+    seconds = milliseconds // 1000
+    minutes = seconds // 60
+    seconds = seconds % 60
+
+    return f"{minutes}:{seconds:02d}"
+
+
+async def delete_message(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 async def run_ffmpeg(args):
+
     def execute():
+        import subprocess
+
         subprocess.run(
             ["ffmpeg", "-y"] + args,
             stdout=subprocess.DEVNULL,
@@ -204,27 +310,13 @@ async def run_ffmpeg(args):
     await asyncio.to_thread(execute)
 
 
-async def delete_message(message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-
-def format_duration(milliseconds):
-    seconds = milliseconds // 1000
-    minutes = seconds // 60
-    seconds = seconds % 60
-
-    return f"{minutes}:{seconds:02d}"
-
-
 # ==========================================
-# START VA BUYRUQLAR
+# 4. START VA BUYRUQLAR
 # ==========================================
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
+
     await message.answer(
         get_text(message.from_user.id)["start"]
     )
@@ -232,13 +324,15 @@ async def start(message: types.Message):
 
 @dp.message(Command("music"))
 async def music_command(message: types.Message):
+
     await message.answer(
-        "🎵 Qo'shiq nomini yozing yoki ovozli parcha yuboring."
+        "🎵 Qo'shiq nomini yozing."
     )
 
 
 @dp.message(Command("video"))
 async def video_command(message: types.Message):
+
     await message.answer(
         "🎬 Video havolasini yuboring yoki video fayl jo'nating."
     )
@@ -246,18 +340,14 @@ async def video_command(message: types.Message):
 
 @dp.message(Command("help"))
 async def help_command(message: types.Message):
+
     await message.answer(
-        "ℹ️ Yordam:\n\n"
-        "1. Video havolasini yuboring.\n"
-        "2. Qo'shiq nomini yozing.\n"
-        "3. Ovozli parcha yuboring.\n"
-        "4. Video yuborib dumaloq video oling.\n"
-        "5. /lang orqali tilni o'zgartiring."
+        get_text(message.from_user.id)["help"]
     )
 
 
 # ==========================================
-# TIL TANLASH
+# 5. TIL TANLASH
 # ==========================================
 
 @dp.message(Command("lang"))
@@ -289,7 +379,7 @@ async def language_command(message: types.Message):
 @dp.callback_query(F.data.startswith("lang_"))
 async def language_callback(callback: types.CallbackQuery):
 
-    lang = callback.data.split("_")[1]
+    lang = callback.data.split("_", 1)[1]
 
     if lang not in TEXTS:
         await callback.answer()
@@ -305,53 +395,59 @@ async def language_callback(callback: types.CallbackQuery):
 
 
 # ==========================================
-# DUMALOQ VIDEO
+# 6. DUMALOQ VIDEO
 # ==========================================
 
 async def create_round(message, file_id, prefix):
 
     t = get_text(message.from_user.id)
 
-    input_file = f"{prefix}_input.mp4"
-    output_file = f"{prefix}_round.mp4"
-
     wait = await message.answer(t["wait"])
 
-    try:
-        file = await bot.get_file(file_id)
+    with tempfile.TemporaryDirectory() as temp_dir:
 
-        await bot.download_file(
-            file.file_path,
-            destination=input_file
+        input_file = os.path.join(
+            temp_dir,
+            "input.mp4"
         )
 
-        await run_ffmpeg([
-            "-i", input_file,
-            "-t", "60",
-            "-vf",
-            "crop='min(iw,ih)':'min(iw,ih)',scale=384:384",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            output_file
-        ])
+        output_file = os.path.join(
+            temp_dir,
+            "round.mp4"
+        )
 
-        if os.path.exists(output_file):
-            await message.answer_video_note(
-                FSInputFile(output_file)
+        try:
+            tg_file = await bot.get_file(file_id)
+
+            await bot.download_file(
+                tg_file.file_path,
+                destination=input_file
             )
 
-    except Exception:
-        logging.exception("Round video error")
-        await message.answer(t["error"])
+            await run_ffmpeg([
+                "-i", input_file,
+                "-t", "60",
+                "-vf",
+                "crop='min(iw,ih)':'min(iw,ih)',scale=384:384",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+                output_file
+            ])
 
-    finally:
-        await delete_message(wait)
+            if os.path.exists(output_file):
+                await message.answer_video_note(
+                    FSInputFile(output_file)
+                )
 
-        for file in [input_file, output_file]:
-            if os.path.exists(file):
-                os.remove(file)
+        except Exception:
+            logger.exception("Round video error")
+            await message.answer(t["error"])
+
+        finally:
+            await delete_message(wait)
 
 
 @dp.message(F.video)
@@ -365,18 +461,23 @@ async def video_message(message: types.Message):
 
 
 # ==========================================
-# VIDEO YUKLASH
+# 7. VIDEO YUKLASH
 # ==========================================
 
 def download_video(url, filename):
 
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("Noto'g'ri video havolasi")
+
     options = {
         "format": "best[ext=mp4]/best",
         "outtmpl": filename,
+        "merge_output_format": "mp4",
         "max_filesize": MAX_VIDEO_BYTES,
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True
+        "noplaylist": True,
+        "socket_timeout": 30
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -388,55 +489,56 @@ async def url_message(message: types.Message):
 
     t = get_text(message.from_user.id)
 
-    filename = (
-        f"video_{message.from_user.id}_"
-        f"{message.message_id}.mp4"
-    )
-
     wait = await message.answer(t["wait"])
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="🎵 MP3",
-                callback_data="extract"
-            ),
-            InlineKeyboardButton(
-                text="🎥 Round",
-                callback_data="round"
-            )
-        ]]
-    )
+    with tempfile.TemporaryDirectory() as temp_dir:
 
-    try:
-        await asyncio.to_thread(
-            download_video,
-            message.text.strip(),
-            filename
+        filename = os.path.join(
+            temp_dir,
+            "video.mp4"
         )
 
-        if os.path.exists(filename):
-            await message.answer_video(
-                FSInputFile(filename),
-                caption="📥 Video tayyor!",
-                reply_markup=keyboard
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🎵 MP3",
+                    callback_data="extract"
+                ),
+                InlineKeyboardButton(
+                    text="🎥 Round",
+                    callback_data="round"
+                )
+            ]]
+        )
+
+        try:
+            await asyncio.to_thread(
+                download_video,
+                message.text.strip(),
+                filename
             )
-        else:
+
+            if os.path.exists(filename):
+
+                await message.answer_video(
+                    FSInputFile(filename),
+                    caption=t["video_ready"],
+                    reply_markup=keyboard
+                )
+
+            else:
+                await message.answer(t["error"])
+
+        except Exception:
+            logger.exception("Video download error")
             await message.answer(t["error"])
 
-    except Exception:
-        logging.exception("Download error")
-        await message.answer(t["error"])
-
-    finally:
-        await delete_message(wait)
-
-        if os.path.exists(filename):
-            os.remove(filename)
+        finally:
+            await delete_message(wait)
 
 
 # ==========================================
-# VIDEODAN MP3
+# 8. VIDEODAN MP3
 # ==========================================
 
 @dp.callback_query(F.data == "extract")
@@ -447,45 +549,50 @@ async def extract_audio(callback: types.CallbackQuery):
     if not callback.message.video:
         return
 
-    input_file = f"extract_{callback.id}.mp4"
-    output_file = f"extract_{callback.id}.mp3"
+    with tempfile.TemporaryDirectory() as temp_dir:
 
-    try:
-        file = await bot.get_file(
-            callback.message.video.file_id
+        input_file = os.path.join(
+            temp_dir,
+            "input.mp4"
         )
 
-        await bot.download_file(
-            file.file_path,
-            destination=input_file
+        output_file = os.path.join(
+            temp_dir,
+            "audio.mp3"
         )
 
-        await run_ffmpeg([
-            "-i", input_file,
-            "-vn",
-            "-b:a", "192k",
-            output_file
-        ])
+        try:
+            tg_file = await bot.get_file(
+                callback.message.video.file_id
+            )
 
-        await callback.message.answer_audio(
-            FSInputFile(output_file)
-        )
+            await bot.download_file(
+                tg_file.file_path,
+                destination=input_file
+            )
 
-    except Exception:
-        logging.exception("MP3 extraction error")
+            await run_ffmpeg([
+                "-i", input_file,
+                "-vn",
+                "-codec:a", "libmp3lame",
+                "-b:a", "192k",
+                output_file
+            ])
 
-        await callback.message.answer(
-            get_text(callback.from_user.id)["error"]
-        )
+            await callback.message.answer_audio(
+                FSInputFile(output_file)
+            )
 
-    finally:
-        for file in [input_file, output_file]:
-            if os.path.exists(file):
-                os.remove(file)
+        except Exception:
+            logger.exception("MP3 extraction error")
+
+            await callback.message.answer(
+                get_text(callback.from_user.id)["error"]
+            )
 
 
 # ==========================================
-# ROUND TUGMASI
+# 9. ROUND TUGMASI
 # ==========================================
 
 @dp.callback_query(F.data == "round")
@@ -494,6 +601,7 @@ async def round_callback(callback: types.CallbackQuery):
     await callback.answer()
 
     if callback.message.video:
+
         await create_round(
             callback.message,
             callback.message.video.file_id,
@@ -502,7 +610,7 @@ async def round_callback(callback: types.CallbackQuery):
 
 
 # ==========================================
-# AUDD MUSIQA ANIQLASH
+# 10. AUDD MUSIQA ANIQLASH
 # ==========================================
 
 async def recognize_music(message, file_id, file_size):
@@ -514,95 +622,94 @@ async def recognize_music(message, file_id, file_size):
         return
 
     if file_size and file_size > MAX_AUDIO_BYTES:
-        await message.answer("Audio fayl juda katta.")
+        await message.answer(t["too_large"])
         return
 
     wait = await message.answer(t["recognizing"])
 
-    filename = (
-        f"recognize_{message.from_user.id}_"
-        f"{message.message_id}.audio"
-    )
+    with tempfile.TemporaryDirectory() as temp_dir:
 
-    try:
-        tg_file = await bot.get_file(file_id)
-
-        await bot.download_file(
-            tg_file.file_path,
-            destination=filename
+        filename = os.path.join(
+            temp_dir,
+            "audio_sample"
         )
 
-        timeout = aiohttp.ClientTimeout(total=60)
+        try:
+            tg_file = await bot.get_file(file_id)
 
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
+            await bot.download_file(
+                tg_file.file_path,
+                destination=filename
+            )
 
-            with open(filename, "rb") as audio:
+            timeout = aiohttp.ClientTimeout(total=60)
 
-                form = aiohttp.FormData()
+            async with aiohttp.ClientSession(
+                timeout=timeout
+            ) as session:
 
-                form.add_field(
-                    "api_token",
-                    AUDD_TOKEN
-                )
+                with open(filename, "rb") as audio:
 
-                form.add_field(
-                    "file",
-                    audio,
-                    filename="audio_sample",
-                    content_type="application/octet-stream"
-                )
+                    form = aiohttp.FormData()
 
-                async with session.post(
-                    "https://api.audd.io/",
-                    data=form
-                ) as response:
+                    form.add_field(
+                        "api_token",
+                        AUDD_TOKEN
+                    )
 
-                    data = await response.json()
+                    form.add_field(
+                        "file",
+                        audio,
+                        filename="audio_sample",
+                        content_type="application/octet-stream"
+                    )
 
-        result = data.get("result")
+                    async with session.post(
+                        "https://api.audd.io/",
+                        data=form
+                    ) as response:
 
-        if data.get("status") != "success" or not result:
-            await message.answer(t["not_found"])
-            return
+                        data = await response.json()
 
-        title = result.get("title", "Unknown")
-        artist = result.get("artist", "Unknown")
-        album = result.get("album", "")
+            result = data.get("result")
 
-        sent = await send_song(
-            message,
-            title,
-            artist
-        )
+            if data.get("status") != "success" or not result:
+                await message.answer(t["not_found"])
+                return
 
-        if sent:
-            return
+            title = result.get("title", "Unknown")
+            artist = result.get("artist", "Unknown")
+            album = result.get("album", "")
 
-        link = result.get("song_link", "")
+            sent = await send_song(
+                message,
+                title,
+                artist
+            )
 
-        text = (
-            f"🎵 {title}\n"
-            f"🎤 {artist}\n"
-            f"💿 {album}\n\n"
-            f"{t['not_library']}"
-        )
+            if sent:
+                return
 
-        if link:
-            text += f"\n{link}"
+            link = result.get("song_link", "")
 
-        await message.answer(text)
+            text = (
+                f"🎵 {title}\n"
+                f"🎤 {artist}\n"
+                f"💿 {album}\n\n"
+                f"{t['no_library']}"
+            )
 
-    except Exception:
-        logging.exception("Recognition error")
-        await message.answer(t["error"])
+            if link:
+                text += f"\n{link}"
 
-    finally:
-        await delete_message(wait)
+            await message.answer(text)
 
-        if os.path.exists(filename):
-            os.remove(filename)
+        except Exception:
+            logger.exception("Recognition error")
+            await message.answer(t["error"])
+
+        finally:
+            await delete_message(wait)
 
 
 @dp.message(F.voice)
@@ -626,8 +733,7 @@ async def audio_handler(message: types.Message):
 
 
 # ==========================================
-# QO'SHIQ NOMI BILAN QIDIRISH
-# RASMDAGIDEK 10 TA NATIJA
+# 11. MUSIQA QIDIRISH
 # ==========================================
 
 @dp.message(F.text)
@@ -653,10 +759,13 @@ async def search_song(message: types.Message):
                 params={
                     "term": query,
                     "entity": "song",
-                    "limit": 10
+                    "limit": MAX_SEARCH_RESULTS
                 },
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
+
+                if response.status != 200:
+                    raise RuntimeError("iTunes API xatosi")
 
                 data = await response.json()
 
@@ -670,14 +779,21 @@ async def search_song(message: types.Message):
 
         for song in results:
 
+            title = song.get("trackName")
+            artist = song.get("artistName")
+
+            if not title or not artist:
+                continue
+
             songs.append({
-                "title": song.get("trackName", "Unknown"),
-                "artist": song.get("artistName", "Unknown"),
-                "duration": song.get("trackTimeMillis", 0),
-                "link": song.get("trackViewUrl", "")
+                "title": title,
+                "artist": artist,
+                "duration": song.get("trackTimeMillis", 0)
             })
 
-        # Natijalar ro'yxati
+        if not songs:
+            await message.answer(t["not_found"])
+            return
 
         text = f"🔍 {query}\n\n"
 
@@ -692,13 +808,11 @@ async def search_song(message: types.Message):
                 f"{song['title']} {duration}\n"
             )
 
-        # Raqamli tugmalar
-
-        keyboard_buttons = []
+        buttons = []
 
         for i in range(len(songs)):
 
-            keyboard_buttons.append(
+            buttons.append(
                 InlineKeyboardButton(
                     text=str(i + 1),
                     callback_data=f"pick_{i}"
@@ -707,8 +821,8 @@ async def search_song(message: types.Message):
 
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                keyboard_buttons[i:i + 5]
-                for i in range(0, len(keyboard_buttons), 5)
+                buttons[i:i + 5]
+                for i in range(0, len(buttons), 5)
             ]
         )
 
@@ -717,18 +831,20 @@ async def search_song(message: types.Message):
             reply_markup=keyboard
         )
 
-        # Foydalanuvchi natijalarini alohida saqlash
-
         key = (
             message.from_user.id,
             message.chat.id,
             result_message.message_id
         )
 
+        # Eski natijalarni cheklash
+        if len(search_results) >= MAX_STORED_SEARCHES:
+            search_results.clear()
+
         search_results[key] = songs
 
     except Exception:
-        logging.exception("Music search error")
+        logger.exception("Music search error")
         await message.answer(t["error"])
 
     finally:
@@ -736,14 +852,14 @@ async def search_song(message: types.Message):
 
 
 # ==========================================
-# QO'SHIQ TANLASH
+# 12. RAQAM ORQALI QO'SHIQ TANLASH
 # ==========================================
 
 @dp.callback_query(F.data.startswith("pick_"))
 async def select_song(callback: types.CallbackQuery):
 
     try:
-        index = int(callback.data.split("_")[1])
+        index = int(callback.data.split("_", 1)[1])
 
         key = (
             callback.from_user.id,
@@ -756,7 +872,7 @@ async def select_song(callback: types.CallbackQuery):
         if not songs or index < 0 or index >= len(songs):
 
             await callback.answer(
-                "Qidiruv natijasi topilmadi!",
+                get_text(callback.from_user.id)["expired"],
                 show_alert=True
             )
             return
@@ -764,12 +880,13 @@ async def select_song(callback: types.CallbackQuery):
         song = songs[index]
 
         await callback.answer(
-            "⏳ Qo'shiq tekshirilmoqda..."
+            get_text(callback.from_user.id)["selected"]
         )
 
         title = song["title"]
         artist = song["artist"]
 
+        # To'liq MP3 kutubxonadan qidirish
         sent = await send_song(
             callback.message,
             title,
@@ -779,31 +896,24 @@ async def select_song(callback: types.CallbackQuery):
         if sent:
             return
 
-        link = song.get("link")
-
-        if link:
-            await callback.message.answer(
-                f"🎵 {title}\n"
-                f"🎤 {artist}\n\n"
-                "To'liq qo'shiqni rasmiy manbadan tinglang:\n"
-                f"{link}"
-            )
-        else:
-            await callback.message.answer(
-                "😔 Qo'shiq kutubxonada mavjud emas."
-            )
+        await callback.message.answer(
+            f"🎵 {title}\n"
+            f"🎤 {artist}\n\n"
+            f"{get_text(callback.from_user.id)['no_library']}\n\n"
+            "📁 MP3 faylni music_library papkasiga joylashtiring."
+        )
 
     except Exception:
-        logging.exception("Song selection error")
+        logger.exception("Song selection error")
 
         await callback.answer(
-            "Xatolik yuz berdi!",
+            get_text(callback.from_user.id)["error"],
             show_alert=True
         )
 
 
 # ==========================================
-# WEB SERVER
+# 13. WEB SERVER
 # ==========================================
 
 async def handle(request):
@@ -814,7 +924,7 @@ async def handle(request):
 
 
 # ==========================================
-# BOTNI ISHGA TUSHIRISH
+# 14. BOTNI ISHGA TUSHIRISH
 # ==========================================
 
 async def main():
@@ -841,7 +951,7 @@ async def main():
 
     await site.start()
 
-    logging.info(
+    logger.info(
         "Web server started on port %s",
         PORT
     )
