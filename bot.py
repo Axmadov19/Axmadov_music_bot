@@ -9,13 +9,13 @@ import sqlite3
 import shutil
 import subprocess
 import unicodedata
+import time
 
 from pathlib import Path
-from urllib.parse import urlparse
 from difflib import SequenceMatcher
+from contextlib import suppress
 
 import aiohttp
-import yt_dlp
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -29,33 +29,38 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 
-# ==================================================
-# SETTINGS
-# ==================================================
+# =========================================================
+# AX MUSIC SETTINGS
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 AUDD_TOKEN = os.getenv("AUDD_TOKEN", "").strip()
 JAMENDO_CLIENT_ID = os.getenv("JAMENDO_CLIENT_ID", "").strip()
+
 PORT = int(os.getenv("PORT", "8080"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment'da topilmadi!")
+    raise RuntimeError("BOT_TOKEN topilmadi!")
 
 BASE_DIR = Path(__file__).resolve().parent
 
-MUSIC_LIBRARY_DIR = BASE_DIR / "music_library"
 DATA_DIR = BASE_DIR / "data"
 TEMP_DIR = BASE_DIR / "tmp"
-DATABASE_PATH = DATA_DIR / "bot.sqlite3"
+MUSIC_LIBRARY_DIR = BASE_DIR / "music_library"
 
-JAMENDO_URL = "https://api.jamendo.com/v3.0/tracks/"
+DB_PATH = DATA_DIR / "bot.sqlite3"
 
-MAX_VIDEO_BYTES = 48 * 1024 * 1024
+JAMENDO_API = "https://api.jamendo.com/v3.0/tracks/"
+
+MAX_RESULTS = 12
+PAGE_SIZE = 4
+
 MAX_AUDIO_BYTES = 48 * 1024 * 1024
+MAX_VIDEO_BYTES = 48 * 1024 * 1024
 MAX_VIDEO_SECONDS = 60
 
-MAX_SEARCH_RESULTS = 12
-PAGE_SIZE = 4
+CACHE_LIMIT = 100
+CACHE_TTL = 1800
 
 AUDIO_EXTENSIONS = {
     ".mp3", ".m4a", ".aac",
@@ -81,124 +86,157 @@ dp = Dispatcher()
 SEARCH_CACHE = {}
 
 
-# ==================================================
-# LANGUAGES
-# ==================================================
+# =========================================================
+# LANGUAGE
+# =========================================================
 
 TEXTS = {
     "uz": {
         "start": (
-            "👋 Assalomu alaykum!\n\n"
-            "🎵 Qo'shiq nomini yozing.\n"
-            "🎧 Ovozli parcha yuboring.\n"
-            "🎬 Ruxsat etilgan video havolasini yuboring.\n"
-            "🎥 Video yuborsangiz, dumaloq video qilaman.\n\n"
-            "/music - Musiqa\n"
-            "/video - Video\n"
-            "/help - Yordam\n"
-            "/lang - Til"
+            "🎵 <b>AX MUSIC</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Assalomu alaykum!\n\n"
+            "🎧 Qo'shiq nomini yuboring.\n"
+            "🎤 Ovozli parcha yuboring.\n"
+            "🎵 Audio fayl yuboring.\n"
+            "🎬 Video yuboring.\n\n"
+            "/music — Musiqa qidirish\n"
+            "/video — Video yordam\n"
+            "/lang — Tilni almashtirish\n"
+            "/help — Yordam\n\n"
+            "✨ <i>Smart Music Search</i>"
         ),
-        "wait": "⏳ Kuting...",
-        "recognizing": "🎧 Qo'shiq aniqlanmoqda...",
         "searching": "🔎 AX MUSIC qidirmoqda...",
+        "recognizing": "🎧 Qo'shiq aniqlanmoqda...",
         "not_found": "😔 Qo'shiq topilmadi.",
         "error": "❌ Xatolik yuz berdi.",
+        "wait": "⏳ Iltimos, kuting...",
+        "downloading": "🎵 To'liq audio tayyorlanmoqda...",
+        "download_error": "Audio yuklab olinmadi.",
         "no_audd": "AudD token sozlanmagan.",
         "no_jamendo": "Jamendo CLIENT_ID sozlanmagan.",
-        "language": "Tilni tanlang:",
         "audio_large": "Audio fayl juda katta.",
         "video_large": "Video fayl juda katta.",
-        "bad_url": "Noto'g'ri havola.",
-        "video_ready": "📥 Video tayyor!",
-        "music_help": "🎵 Qo'shiq nomini yozing yoki audio yuboring.",
-        "video_help": "🎬 Video havolasini yuboring yoki video jo'nating.",
-        "expired": "Qidiruv muddati tugagan. Qaytadan qidiring.",
         "ffmpeg": "FFmpeg o'rnatilmagan.",
-        "downloading": "🎵 To'liq audio tayyorlanmoqda...",
-        "download_error": "Audio yuklab olinmadi."
+        "language": "Tilni tanlang:",
+        "expired": "Qidiruv muddati tugagan. Qaytadan qidiring.",
+        "video_ready": "🎥 Video tayyor!",
+        "music_help": "🎵 Qo'shiq nomini yozing yoki audio yuboring.",
+        "video_help": "🎬 Dumaloq video yaratish uchun video yuboring.",
+        "no_full": "⚠️ Bu trekning to'liq versiyasini yuklab olishga ruxsat yo'q.",
+        "preview": "Qisqa tinglash namunasi mavjud.",
+        "match": "MOSLIK",
+        "best": "ENG YAXSHI NATIJA",
+        "similar": "O'XSHASH QO'SHIQLAR",
+        "found": "TA TREK TOPILDI",
+        "page": "SAHIFA",
+        "online": "ONLINE",
+        "full": "TO'LIQ AUDIO",
+        "stream": "NAMUNA",
+        "choose": "Tinglash uchun tugmani bosing."
     },
     "ru": {
         "start": (
-            "👋 Добро пожаловать!\n\n"
+            "🎵 <b>AX MUSIC</b>\n\n"
             "Отправьте название песни или аудио.\n"
-            "Отправьте разрешённую ссылку на видео.\n\n"
-            "/music - Музыка\n"
-            "/video - Видео\n"
-            "/help - Помощь\n"
-            "/lang - Язык"
+            "Также можно отправить видео.\n\n"
+            "/music — Музыка\n"
+            "/video — Видео\n"
+            "/lang — Язык\n"
+            "/help — Помощь"
         ),
-        "wait": "⏳ Подождите...",
-        "recognizing": "🎧 Определяю песню...",
         "searching": "🔎 AX MUSIC ищет...",
+        "recognizing": "🎧 Определяю песню...",
         "not_found": "😔 Песня не найдена.",
         "error": "❌ Произошла ошибка.",
+        "wait": "⏳ Подождите...",
+        "downloading": "🎵 Подготавливаю полную версию...",
+        "download_error": "Не удалось загрузить аудио.",
         "no_audd": "AudD token не настроен.",
         "no_jamendo": "Jamendo CLIENT_ID не настроен.",
-        "language": "Выберите язык:",
         "audio_large": "Аудиофайл слишком большой.",
         "video_large": "Видеофайл слишком большой.",
-        "bad_url": "Неверная ссылка.",
-        "video_ready": "📥 Видео готово!",
-        "music_help": "🎵 Отправьте название песни или аудио.",
-        "video_help": "🎬 Отправьте ссылку или видео.",
-        "expired": "Срок поиска истёк.",
         "ffmpeg": "FFmpeg не установлен.",
-        "downloading": "🎵 Подготавливаю полную версию...",
-        "download_error": "Не удалось загрузить аудио."
+        "language": "Выберите язык:",
+        "expired": "Поиск истёк. Попробуйте снова.",
+        "video_ready": "🎥 Видео готово!",
+        "music_help": "Отправьте название песни или аудио.",
+        "video_help": "Отправьте видео для создания круглого видео.",
+        "no_full": "⚠️ Полная загрузка этого трека недоступна.",
+        "preview": "Доступен короткий фрагмент.",
+        "match": "СОВПАДЕНИЕ",
+        "best": "ЛУЧШИЙ РЕЗУЛЬТАТ",
+        "similar": "ПОХОЖИЕ ТРЕКИ",
+        "found": "ТРЕКОВ НАЙДЕНО",
+        "page": "СТРАНИЦА",
+        "online": "ONLINE",
+        "full": "ПОЛНОЕ АУДИО",
+        "stream": "ФРАГМЕНТ",
+        "choose": "Нажмите кнопку для прослушивания."
     },
     "en": {
         "start": (
-            "👋 Welcome!\n\n"
+            "🎵 <b>AX MUSIC</b>\n\n"
             "Send a song title or audio snippet.\n"
-            "Send a permitted video link.\n\n"
-            "/music - Music\n"
-            "/video - Video\n"
-            "/help - Help\n"
-            "/lang - Language"
+            "You can also send a video.\n\n"
+            "/music — Music\n"
+            "/video — Video\n"
+            "/lang — Language\n"
+            "/help — Help"
         ),
-        "wait": "⏳ Please wait...",
+        "searching": "🔎 AX MUSIC is searching...",
         "recognizing": "🎧 Identifying song...",
-        "searching": "🔎 AX MUSIC searching...",
         "not_found": "😔 Song not found.",
         "error": "❌ An error occurred.",
+        "wait": "⏳ Please wait...",
+        "downloading": "🎵 Preparing full audio...",
+        "download_error": "Audio download failed.",
         "no_audd": "AudD token is not configured.",
         "no_jamendo": "Jamendo CLIENT_ID is not configured.",
-        "language": "Choose a language:",
         "audio_large": "Audio file is too large.",
         "video_large": "Video file is too large.",
-        "bad_url": "Invalid URL.",
-        "video_ready": "📥 Video ready!",
-        "music_help": "🎵 Send a song title or audio.",
-        "video_help": "🎬 Send a video link or video file.",
-        "expired": "Search expired.",
         "ffmpeg": "FFmpeg is not installed.",
-        "downloading": "🎵 Preparing the full version...",
-        "download_error": "Audio download failed."
+        "language": "Choose a language:",
+        "expired": "Search expired. Please search again.",
+        "video_ready": "🎥 Video ready!",
+        "music_help": "Send a song title or audio.",
+        "video_help": "Send a video to create a round video.",
+        "no_full": "⚠️ Full download is not available for this track.",
+        "preview": "A short preview is available.",
+        "match": "MATCH",
+        "best": "BEST MATCH",
+        "similar": "SIMILAR TRACKS",
+        "found": "TRACKS FOUND",
+        "page": "PAGE",
+        "online": "ONLINE",
+        "full": "FULL AUDIO",
+        "stream": "PREVIEW",
+        "choose": "Press a button to listen."
     }
 }
 
 
-# ==================================================
+# =========================================================
 # DATABASE
-# ==================================================
+# =========================================================
 
 def init_database():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(DATABASE_PATH) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_settings (
+            CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                language TEXT NOT NULL DEFAULT 'uz'
+                language TEXT DEFAULT 'uz'
             )
         """)
         conn.commit()
 
 
 def get_language(user_id):
-    with sqlite3.connect(DATABASE_PATH) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT language FROM user_settings WHERE user_id=?",
+            "SELECT language FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
 
@@ -208,7 +246,7 @@ def get_language(user_id):
     return "uz"
 
 
-def get_text(user_id):
+def T(user_id):
     return TEXTS[get_language(user_id)]
 
 
@@ -216,9 +254,9 @@ def set_language(user_id, language):
     if language not in TEXTS:
         return
 
-    with sqlite3.connect(DATABASE_PATH) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
-            INSERT INTO user_settings(user_id, language)
+            INSERT INTO users(user_id, language)
             VALUES(?, ?)
             ON CONFLICT(user_id)
             DO UPDATE SET language=excluded.language
@@ -226,27 +264,28 @@ def set_language(user_id, language):
         conn.commit()
 
 
-# ==================================================
+# =========================================================
 # HELPERS
-# ==================================================
+# =========================================================
 
 def normalize(value):
-    value = unicodedata.normalize("NFKD", str(value)).casefold()
+    value = unicodedata.normalize("NFKD", str(value))
+    value = value.casefold()
 
     value = "".join(
-        char for char in value
-        if not unicodedata.combining(char)
+        c for c in value
+        if not unicodedata.combining(c)
     )
 
     value = "".join(
-        char if char.isalnum() else " "
-        for char in value
+        c if c.isalnum() else " "
+        for c in value
     )
 
     return re.sub(r"\s+", " ", value).strip()
 
 
-def calculate_match(query, title, artist=""):
+def match_score(query, title, artist):
     query = normalize(query)
     target = normalize(f"{title} {artist}")
 
@@ -261,7 +300,11 @@ def calculate_match(query, title, artist=""):
     target_words = set(target.split())
 
     if query_words:
-        overlap = len(query_words & target_words) / len(query_words)
+        overlap = (
+            len(query_words & target_words)
+            / len(query_words)
+        )
+
         score = max(score, overlap)
 
     return min(100, round(score * 100))
@@ -274,59 +317,6 @@ def format_duration(seconds):
         seconds = 0
 
     return f"{seconds // 60}:{seconds % 60:02d}"
-
-
-def find_song(query):
-    if not MUSIC_LIBRARY_DIR.exists():
-        return None
-
-    query = normalize(query)
-
-    if not query:
-        return None
-
-    best_match = None
-    best_score = 0
-
-    for file in MUSIC_LIBRARY_DIR.rglob("*"):
-        if not file.is_file():
-            continue
-
-        if file.suffix.lower() not in AUDIO_EXTENSIONS:
-            continue
-
-        filename = normalize(file.stem)
-
-        if query == filename:
-            return file
-
-        score = SequenceMatcher(
-            None, query, filename
-        ).ratio()
-
-        if query in filename or filename in query:
-            score = max(score, 0.90)
-
-        if score > best_score:
-            best_match = file
-            best_score = score
-
-    return best_match if best_score >= 0.45 else None
-
-
-async def delete_message(message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-
-async def safe_delete(path):
-    try:
-        if path and path.exists():
-            await asyncio.to_thread(path.unlink)
-    except OSError:
-        logger.warning("Temporary file delete error: %s", path)
 
 
 def ffmpeg_available():
@@ -351,6 +341,25 @@ async def run_ffmpeg(args):
     await asyncio.to_thread(execute)
 
 
+async def safe_delete(path):
+    if not path:
+        return
+
+    try:
+        path = Path(path)
+
+        if path.exists():
+            await asyncio.to_thread(path.unlink)
+
+    except OSError:
+        logger.warning("File cleanup error: %s", path)
+
+
+async def delete_message(message):
+    with suppress(Exception):
+        await message.delete()
+
+
 async def download_telegram_file(file_id, destination):
     file_info = await bot.get_file(file_id)
 
@@ -360,21 +369,38 @@ async def download_telegram_file(file_id, destination):
     )
 
 
-# ==================================================
-# JAMENDO SEARCH
-# ==================================================
+# =========================================================
+# CACHE
+# =========================================================
+
+def clean_cache():
+    now = time.time()
+
+    expired = [
+        key for key, value in SEARCH_CACHE.items()
+        if now - value["created"] > CACHE_TTL
+    ]
+
+    for key in expired:
+        SEARCH_CACHE.pop(key, None)
+
+    while len(SEARCH_CACHE) > CACHE_LIMIT:
+        oldest = min(
+            SEARCH_CACHE,
+            key=lambda k: SEARCH_CACHE[k]["created"]
+        )
+        SEARCH_CACHE.pop(oldest, None)
+
+
+# =========================================================
+# JAMENDO MUSIC SEARCH
+# =========================================================
 
 async def search_jamendo(query):
-    client_id = JAMENDO_CLIENT_ID.strip()
+    if not JAMENDO_CLIENT_ID:
+        raise RuntimeError("JAMENDO_CLIENT_ID sozlanmagan")
 
-    if not client_id:
-        raise RuntimeError(
-            "JAMENDO_CLIENT_ID Render Environment'da mavjud emas"
-        )
-
-    query = (query or "").strip()
-
-    if not query:
+    if not query.strip():
         return []
 
     timeout = aiohttp.ClientTimeout(
@@ -384,9 +410,9 @@ async def search_jamendo(query):
     )
 
     params = {
-        "client_id": client_id,
+        "client_id": JAMENDO_CLIENT_ID,
         "format": "json",
-        "limit": MAX_SEARCH_RESULTS,
+        "limit": MAX_RESULTS,
         "search": query,
         "type": "single albumtrack",
         "audioformat": "mp32",
@@ -396,79 +422,46 @@ async def search_jamendo(query):
     }
 
     headers = {
-        "User-Agent": "AX-MUSIC-BOT/2.0"
+        "User-Agent": "AX-MUSIC-BOT/3.0"
     }
 
-    try:
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers=headers
-        ) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers
+    ) as session:
 
-            async with session.get(
-                JAMENDO_URL,
-                params=params
-            ) as response:
+        async with session.get(
+            JAMENDO_API,
+            params=params
+        ) as response:
 
-                response_text = await response.text()
+            body = await response.text()
 
-                if response.status != 200:
-                    logger.error(
-                        "Jamendo HTTP error: status=%s body=%s",
-                        response.status,
-                        response_text[:1500]
-                    )
+            if response.status != 200:
+                logger.error(
+                    "Jamendo HTTP %s: %s",
+                    response.status,
+                    body[:1000]
+                )
+                raise RuntimeError(
+                    f"Jamendo HTTP {response.status}"
+                )
 
-                    raise RuntimeError(
-                        f"Jamendo HTTP {response.status}"
-                    )
-
-                try:
-                    data = await response.json(
-                        content_type=None
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Jamendo JSON error: %s | body=%s",
-                        exc,
-                        response_text[:1500]
-                    )
-                    raise RuntimeError(
-                        "Jamendo noto'g'ri JSON qaytardi"
-                    ) from exc
-
-    except asyncio.TimeoutError as exc:
-        logger.exception("Jamendo timeout")
-        raise RuntimeError(
-            "Jamendo server javob bermadi"
-        ) from exc
-
-    except aiohttp.ClientError as exc:
-        logger.exception("Jamendo connection error")
-        raise RuntimeError(
-            "Jamendo bilan ulanishda xatolik"
-        ) from exc
+            data = await response.json(
+                content_type=None
+            )
 
     if not isinstance(data, dict):
-        raise RuntimeError("Jamendo javobi noto'g'ri formatda")
+        raise RuntimeError("Jamendo javobi noto'g'ri")
 
-    api_headers = data.get("headers") or {}
+    api_status = (data.get("headers") or {}).get("status")
 
-    if api_headers.get("status") != "success":
-        error_message = api_headers.get(
+    if api_status != "success":
+        error = (data.get("headers") or {}).get(
             "error_message",
-            "Noma'lum Jamendo API xatosi"
+            "API error"
         )
-
-        logger.error(
-            "Jamendo API rejected request: %s | headers=%s",
-            error_message,
-            api_headers
-        )
-
-        raise RuntimeError(
-            f"Jamendo API: {error_message}"
-        )
+        raise RuntimeError(str(error))
 
     results = []
 
@@ -476,8 +469,6 @@ async def search_jamendo(query):
         try:
             title = item.get("name") or "Unknown"
             artist = item.get("artist_name") or "Unknown"
-
-            duration = int(item.get("duration") or 0)
 
             allowed_value = item.get(
                 "audiodownload_allowed",
@@ -499,47 +490,44 @@ async def search_jamendo(query):
                 "title": title,
                 "artist": artist,
                 "album": item.get("album_name") or "",
-                "duration": format_duration(duration),
-                "duration_seconds": duration,
+                "duration": format_duration(
+                    item.get("duration")
+                ),
+                "duration_seconds": int(
+                    item.get("duration") or 0
+                ),
                 "preview": item.get("audio") or None,
                 "download": download_url,
-                "download_allowed": allowed,
+                "download_allowed": bool(
+                    allowed and download_url
+                ),
                 "link": item.get("shareurl") or "",
                 "artwork": item.get("image") or "",
                 "license": item.get("license_ccurl") or "",
-                "score": calculate_match(
-                    query,
-                    title,
-                    artist
+                "score": match_score(
+                    query, title, artist
                 )
             })
 
-        except (TypeError, ValueError, AttributeError):
-            logger.exception(
-                "Jamendo track parsing error: %s",
-                item
-            )
+        except (ValueError, TypeError, AttributeError):
+            logger.exception("Track parsing error")
 
+    # Full download permission is prioritized,
+    # then the relevance score.
     results.sort(
-        key=lambda item: (
-            item["score"],
-            item["download_allowed"]
+        key=lambda x: (
+            x["download_allowed"],
+            x["score"]
         ),
         reverse=True
-    )
-
-    logger.info(
-        "Jamendo search successful: query=%r results=%d",
-        query,
-        len(results)
     )
 
     return results
 
 
-# ==================================================
-# MUSIC SEARCH RESULT UI
-# ==================================================
+# =========================================================
+# RESULT KEYBOARD
+# =========================================================
 
 def make_music_keyboard(search_id, page, results):
     start = page * PAGE_SIZE
@@ -557,9 +545,11 @@ def make_music_keyboard(search_id, page, results):
         ])
 
     for index, song in enumerate(current, start=start):
+        title = song["title"][:30]
+
         rows.append([
             InlineKeyboardButton(
-                text=f"🎵 {song['title'][:30]}",
+                text=f"🎵 {title}",
                 callback_data=f"play:{search_id}:{index}"
             )
         ])
@@ -585,48 +575,20 @@ def make_music_keyboard(search_id, page, results):
     if navigation:
         rows.append(navigation)
 
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
+
+# =========================================================
+# RESULT TEXT
+# =========================================================
 
 def make_results_text(query, results, page, user_id):
-    language = get_language(user_id)
-
-    labels = {
-        "uz": {
-            "search": "SMART MUSIQA QIDIRUVI",
-            "result": "QIDIRUV NATIJASI",
-            "best": "ENG YAXSHI NATIJA",
-            "similar": "O'XSHASH QO'SHIQLAR",
-            "found": "TA TREK TOPILDI",
-            "match": "MOSLIK",
-            "page": "SAHIFA",
-            "online": "ONLINE"
-        },
-        "ru": {
-            "search": "ПОИСК МУЗЫКИ",
-            "result": "РЕЗУЛЬТАТ ПОИСКА",
-            "best": "ЛУЧШИЙ РЕЗУЛЬТАТ",
-            "similar": "ПОХОЖИЕ ТРЕКИ",
-            "found": "ТРЕКОВ НАЙДЕНО",
-            "match": "СОВПАДЕНИЕ",
-            "page": "СТРАНИЦА",
-            "online": "ONLINE"
-        },
-        "en": {
-            "search": "SMART MUSIC SEARCH",
-            "result": "SEARCH RESULT",
-            "best": "BEST MATCH",
-            "similar": "SIMILAR TRACKS",
-            "found": "TRACKS FOUND",
-            "match": "MATCH",
-            "page": "PAGE",
-            "online": "ONLINE"
-        }
-    }
-
-    t = labels[language]
+    t = T(user_id)
 
     total = len(results)
+
     total_pages = max(
         1,
         (total + PAGE_SIZE - 1) // PAGE_SIZE
@@ -641,19 +603,17 @@ def make_results_text(query, results, page, user_id):
 
     text = (
         "🎵 <b>AX MUSIC</b>\n"
-        f"<i>{t['search']}</i>\n"
-        f"🟢 <b>{t['online']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 <b>{t['online']}</b>\n\n"
         f"🔎 <b>{html.escape(query)}</b>\n\n"
         "╭━━━━━━━━━━━━━━━━━━╮\n"
-        f"  <b>{t['result']} / 001</b>\n\n"
+        f"  <b>{t['best']}</b>\n\n"
         f"  🎧 <b>{html.escape(best['title'])}</b>\n"
         f"  👤 {html.escape(best['artist'])}\n"
         f"  ⏱ {best['duration']}\n"
-        f"  ⭐ {t['best']}: {best['score']}%\n"
+        f"  ⭐ {best['score']}%\n"
         "╰━━━━━━━━━━━━━━━━━━╯\n\n"
         f"🎼 <b>{t['similar']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
         f"📀 <b>{total} {t['found']}</b>\n\n"
     )
 
@@ -662,9 +622,9 @@ def make_results_text(query, results, page, user_id):
         start=page * PAGE_SIZE + 1
     ):
         status = (
-            "✅ FULL AUDIO"
+            f"✅ {t['full']}"
             if song["download_allowed"]
-            else "🔗 STREAM ONLY"
+            else f"🔊 {t['stream']}"
         )
 
         text += (
@@ -673,22 +633,26 @@ def make_results_text(query, results, page, user_id):
             f"👤 {html.escape(song['artist'])}\n"
             f"⏱ {song['duration']}  "
             f"🎯 {t['match']}: {song['score']}%\n"
-            f"📥 {status}\n"
+            f"{status}\n"
             "━━━━━━━━━━━━━━━━━━\n"
         )
 
     text += (
         f"\n📄 <b>{t['page']} "
-        f"{page + 1:02d}/{total_pages:02d}</b>\n"
-        "\n👇 <i>Tinglash uchun tugmani bosing.</i>"
+        f"{page + 1:02d}/{total_pages:02d}</b>\n\n"
+        f"👇 <i>{t['choose']}</i>"
     )
 
     return text
 
 
+# =========================================================
+# SHOW SEARCH RESULTS
+# =========================================================
+
 async def show_music_results(message, query):
     user_id = message.from_user.id
-    t = get_text(user_id)
+    t = T(user_id)
 
     wait = await message.answer(t["searching"])
 
@@ -699,49 +663,43 @@ async def show_music_results(message, query):
             await wait.edit_text(t["not_found"])
             return
 
+        clean_cache()
+
         search_id = uuid.uuid4().hex[:10]
 
         SEARCH_CACHE[search_id] = {
             "query": query,
             "results": results,
-            "user_id": user_id
+            "user_id": user_id,
+            "created": time.time()
         }
 
-        while len(SEARCH_CACHE) > 100:
-            SEARCH_CACHE.pop(
-                next(iter(SEARCH_CACHE)),
-                None
-            )
-
         await wait.edit_text(
-            make_results_text(query, results, 0, user_id),
+            make_results_text(
+                query,
+                results,
+                0,
+                user_id
+            ),
             reply_markup=make_music_keyboard(
-                search_id, 0, results
+                search_id,
+                0,
+                results
             )
-        )
-
-    except RuntimeError as exc:
-        logger.error(
-            "Music search API/configuration error: %s",
-            exc
-        )
-
-        await wait.edit_text(
-            "❌ Musiqa qidirishda xatolik.\n"
-            "Render Logs va Environment sozlamalarini tekshiring."
         )
 
     except Exception:
-        logger.exception("Unexpected music search error")
+        logger.exception("Music search error")
 
         await wait.edit_text(
-            "❌ Kutilmagan xatolik yuz berdi."
+            "❌ Musiqa qidirishda xatolik.\n"
+            "Render Logs va API sozlamalarini tekshiring."
         )
 
 
-# ==================================================
+# =========================================================
 # PAGINATION
-# ==================================================
+# =========================================================
 
 @dp.callback_query(F.data.startswith("page:"))
 async def page_callback(callback):
@@ -749,18 +707,20 @@ async def page_callback(callback):
         _, search_id, page_text = callback.data.split(":")
         page = int(page_text)
 
+        clean_cache()
+
         cached = SEARCH_CACHE.get(search_id)
 
         if not cached:
             await callback.answer(
-                get_text(callback.from_user.id)["expired"],
+                T(callback.from_user.id)["expired"],
                 show_alert=True
             )
             return
 
         if cached["user_id"] != callback.from_user.id:
             await callback.answer(
-                "Bu qidiruv boshqa foydalanuvchiga tegishli.",
+                "Bu qidiruv sizga tegishli emas.",
                 show_alert=True
             )
             return
@@ -793,22 +753,26 @@ async def page_callback(callback):
         await callback.answer()
 
     except Exception:
-        logger.exception("Pagination error")
+        logger.exception("Page callback error")
         await callback.answer(
             "Xatolik yuz berdi.",
             show_alert=True
         )
 
 
-# ==================================================
-# LICENSED AUDIO DOWNLOAD
-# ==================================================
+# =========================================================
+# DOWNLOAD LICENSED FULL AUDIO
+# =========================================================
 
-async def download_licensed_audio(url, destination):
-    timeout = aiohttp.ClientTimeout(total=180)
+async def download_audio(url, destination):
+    timeout = aiohttp.ClientTimeout(
+        total=180,
+        connect=20,
+        sock_read=60
+    )
 
     headers = {
-        "User-Agent": "AX-MUSIC-BOT/2.0"
+        "User-Agent": "AX-MUSIC-BOT/3.0"
     }
 
     async with aiohttp.ClientSession(
@@ -829,7 +793,7 @@ async def download_licensed_audio(url, destination):
 
             if "text/html" in content_type:
                 raise RuntimeError(
-                    "Audio o'rniga HTML javobi olindi"
+                    "Audio o'rniga HTML qaytdi"
                 )
 
             total = 0
@@ -842,7 +806,7 @@ async def download_licensed_audio(url, destination):
 
                     if total > MAX_AUDIO_BYTES:
                         raise ValueError(
-                            "Audio fayl hajmi chegaradan oshdi"
+                            "Audio hajmi chegaradan oshdi"
                         )
 
                     file.write(chunk)
@@ -856,6 +820,18 @@ async def download_licensed_audio(url, destination):
     return True
 
 
+# =========================================================
+# PREVIEW DOWNLOAD
+# =========================================================
+
+async def download_preview(url, destination):
+    await download_audio(url, destination)
+
+
+# =========================================================
+# PLAY MUSIC
+# =========================================================
+
 @dp.callback_query(F.data.startswith("play:"))
 async def play_callback(callback):
     path = None
@@ -865,11 +841,13 @@ async def play_callback(callback):
         _, search_id, index_text = callback.data.split(":")
         index = int(index_text)
 
+        clean_cache()
+
         cached = SEARCH_CACHE.get(search_id)
 
         if not cached:
             await callback.answer(
-                get_text(callback.from_user.id)["expired"],
+                T(callback.from_user.id)["expired"],
                 show_alert=True
             )
             return
@@ -892,91 +870,101 @@ async def play_callback(callback):
 
         song = results[index]
 
-        await callback.answer("Audio tayyorlanmoqda...")
+        await callback.answer("🎵 Audio tayyorlanmoqda...")
 
-        local_file = (
-            find_song(f"{song['artist']} {song['title']}")
-            or find_song(song["title"])
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        path = TEMP_DIR / (
+            f"music_{uuid.uuid4().hex}.mp3"
         )
 
-        if local_file:
+        # Full licensed version
+        if (
+            song["download_allowed"]
+            and song.get("download")
+        ):
+            wait = await callback.message.answer(
+                T(callback.from_user.id)["downloading"]
+            )
+
+            await download_audio(
+                song["download"],
+                path
+            )
+
+            caption = (
+                "🎵 <b>AX MUSIC | FULL AUDIO</b>\n"
+                f"👤 {html.escape(song['artist'])}\n"
+                f"🎧 {html.escape(song['title'])}\n"
+            )
+
+            if song.get("license"):
+                caption += (
+                    "\n<a href=\""
+                    + html.escape(song["license"], quote=True)
+                    + "\">License information</a>"
+                )
+
             await callback.message.answer_audio(
-                FSInputFile(local_file),
+                FSInputFile(path),
                 title=song["title"][:64],
                 performer=song["artist"][:64],
-                caption="🎵 AX MUSIC | FULL AUDIO"
+                caption=caption
             )
-            return
 
-        if (
-            not song.get("download_allowed")
-            or not song.get("download")
-        ):
+        # Preview only when full download is unavailable
+        elif song.get("preview"):
+            wait = await callback.message.answer(
+                "🔊 Qisqa audio namuna tayyorlanmoqda..."
+            )
+
+            await download_preview(
+                song["preview"],
+                path
+            )
+
+            await callback.message.answer_audio(
+                FSInputFile(path),
+                title=(song["title"] + " Preview")[:64],
+                performer=song["artist"][:64],
+                caption=(
+                    "🎵 <b>AX MUSIC | PREVIEW</b>\n"
+                    "⚠️ Bu to'liq qo'shiq emas, qisqa namuna."
+                )
+            )
+
+            if song.get("link"):
+                await callback.message.answer(
+                    "🔗 <a href=\""
+                    + html.escape(song["link"], quote=True)
+                    + "\">Rasmiy trek sahifasi</a>",
+                    disable_web_page_preview=True
+                )
+
+        else:
             text = (
                 f"🎵 <b>{html.escape(song['title'])}</b>\n"
                 f"👤 {html.escape(song['artist'])}\n\n"
-                "⚠️ Bu trekni to'liq yuklab olishga ruxsat yo'q.\n"
+                f"{T(callback.from_user.id)['no_full']}"
             )
-
-            if song.get("preview"):
-                text += "\n🔊 Qisqa tinglash namunasi mavjud."
 
             if song.get("link"):
                 text += (
-                    f'\n\n<a href="{html.escape(song["link"], quote=True)}">'
-                    "Rasmiy sahifani ochish</a>"
-                )
-
-            if song.get("license"):
-                text += (
-                    f'\n<a href="{html.escape(song["license"], quote=True)}">'
-                    "Litsenziya shartlari</a>"
+                    "\n\n<a href=\""
+                    + html.escape(song["link"], quote=True)
+                    + "\">Rasmiy sahifani ochish</a>"
                 )
 
             await callback.message.answer(
                 text,
                 disable_web_page_preview=True
             )
-            return
-
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-        path = TEMP_DIR / (
-            f"jamendo_{uuid.uuid4().hex}.mp3"
-        )
-
-        wait = await callback.message.answer(
-            get_text(callback.from_user.id)["downloading"]
-        )
-
-        await download_licensed_audio(
-            song["download"],
-            path
-        )
-
-        caption = (
-            "🎵 <b>AX MUSIC | FULL VERSION</b>\n"
-            f"👤 {html.escape(song['artist'])}\n"
-        )
-
-        if song.get("license"):
-            caption += (
-                f'\n<a href="{html.escape(song["license"], quote=True)}">'
-                "Creative Commons license</a>"
-            )
-
-        await callback.message.answer_audio(
-            FSInputFile(path),
-            title=song["title"][:64],
-            performer=song["artist"][:64],
-            caption=caption
-        )
 
     except Exception:
-        logger.exception("Play callback error")
+        logger.exception("Play error")
 
         await callback.message.answer(
-            get_text(callback.from_user.id)["download_error"]
+            T(callback.from_user.id)["download_error"]
         )
 
     finally:
@@ -987,368 +975,13 @@ async def play_callback(callback):
             await safe_delete(path)
 
 
-# ==================================================
-# COMMANDS
-# ==================================================
-
-@dp.message(Command("start"))
-async def start_handler(message):
-    await message.answer(
-        get_text(message.from_user.id)["start"]
-    )
-
-
-@dp.message(Command("music"))
-async def music_handler(message):
-    await message.answer(
-        get_text(message.from_user.id)["music_help"]
-    )
-
-
-@dp.message(Command("video"))
-async def video_handler(message):
-    await message.answer(
-        get_text(message.from_user.id)["video_help"]
-    )
-
-
-@dp.message(Command("help"))
-async def help_handler(message):
-    t = get_text(message.from_user.id)
-
-    await message.answer(
-        "ℹ️ <b>Yordam</b>\n\n"
-        f"{t['music_help']}\n"
-        f"{t['video_help']}\n"
-        "/lang - Tilni o'zgartirish"
-    )
-
-
-# ==================================================
-# LANGUAGE SELECTION
-# ==================================================
-
-@dp.message(Command("lang"))
-async def language_handler(message):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="🇺🇿 Uzbek",
-                callback_data="lang_uz"
-            ),
-            InlineKeyboardButton(
-                text="🇷🇺 Russian",
-                callback_data="lang_ru"
-            ),
-            InlineKeyboardButton(
-                text="🇬🇧 English",
-                callback_data="lang_en"
-            )
-        ]]
-    )
-
-    await message.answer(
-        get_text(message.from_user.id)["language"],
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(F.data.startswith("lang_"))
-async def language_callback(callback):
-    language = callback.data.split("_", 1)[1]
-
-    if language not in TEXTS:
-        await callback.answer()
-        return
-
-    set_language(callback.from_user.id, language)
-
-    await callback.answer("OK")
-
-    await callback.message.edit_text(
-        TEXTS[language]["start"]
-    )
-
-
-# ==================================================
-# ROUND VIDEO
-# ==================================================
-
-async def create_round(
-    message,
-    file_id,
-    prefix,
-    file_size=None,
-    user_id=None
-):
-    if user_id is None:
-        user_id = message.from_user.id
-
-    t = get_text(user_id)
-
-    if file_size and file_size > MAX_VIDEO_BYTES:
-        await message.answer(t["video_large"])
-        return
-
-    if not ffmpeg_available():
-        await message.answer(t["ffmpeg"])
-        return
-
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    input_file = TEMP_DIR / f"{prefix}_input.mp4"
-    output_file = TEMP_DIR / f"{prefix}_round.mp4"
-
-    wait = await message.answer(t["wait"])
-
-    try:
-        await download_telegram_file(
-            file_id,
-            input_file
-        )
-
-        if input_file.stat().st_size > MAX_VIDEO_BYTES:
-            await message.answer(t["video_large"])
-            return
-
-        await run_ffmpeg([
-            "-i", str(input_file),
-            "-t", str(MAX_VIDEO_SECONDS),
-            "-vf",
-            "crop='min(iw,ih)':'min(iw,ih)',scale=384:384,fps=30",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "96k",
-            "-movflags", "+faststart",
-            str(output_file)
-        ])
-
-        if not output_file.exists():
-            raise RuntimeError("Video yaratilmadi")
-
-        await message.answer_video_note(
-            FSInputFile(output_file)
-        )
-
-    except Exception:
-        logger.exception("Round video error")
-        await message.answer(t["error"])
-
-    finally:
-        await delete_message(wait)
-        await safe_delete(input_file)
-        await safe_delete(output_file)
-
-
-@dp.message(F.video)
-async def video_message(message):
-    await create_round(
-        message,
-        message.video.file_id,
-        f"round_{message.from_user.id}_{message.message_id}",
-        message.video.file_size
-    )
-
-
-# ==================================================
-# VIDEO DOWNLOAD
-# ==================================================
-
-def download_video(url, filename):
-    options = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": filename,
-        "max_filesize": MAX_VIDEO_BYTES,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 25,
-        "retries": 2
-    }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            url,
-            download=True
-        )
-
-        return ydl.prepare_filename(info)
-
-
-@dp.message(F.text.regexp(r"^https?://"))
-async def url_message(message):
-    t = get_text(message.from_user.id)
-    url = message.text.strip()
-
-    parsed = urlparse(url)
-
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-    ):
-        await message.answer(t["bad_url"])
-        return
-
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    filename = str(
-        TEMP_DIR /
-        f"video_{message.from_user.id}_{message.message_id}.%(ext)s"
-    )
-
-    wait = await message.answer(t["wait"])
-    downloaded_path = None
-
-    try:
-        downloaded_path = await asyncio.to_thread(
-            download_video,
-            url,
-            filename
-        )
-
-        downloaded_path = Path(downloaded_path)
-
-        if not downloaded_path.exists():
-            raise FileNotFoundError("Video topilmadi")
-
-        if downloaded_path.stat().st_size > MAX_VIDEO_BYTES:
-            await message.answer(t["video_large"])
-            return
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="🎵 MP3",
-                    callback_data="extract"
-                ),
-                InlineKeyboardButton(
-                    text="🎥 Round",
-                    callback_data="round"
-                )
-            ]]
-        )
-
-        await message.answer_video(
-            FSInputFile(downloaded_path),
-            caption=t["video_ready"],
-            reply_markup=keyboard
-        )
-
-    except Exception:
-        logger.exception("Video download error")
-        await message.answer(t["error"])
-
-    finally:
-        await delete_message(wait)
-
-        if downloaded_path:
-            await safe_delete(downloaded_path)
-
-        for candidate in TEMP_DIR.glob(
-            f"video_{message.from_user.id}_{message.message_id}.*"
-        ):
-            await safe_delete(candidate)
-
-
-# ==================================================
-# VIDEO TO MP3
-# ==================================================
-
-@dp.callback_query(F.data == "extract")
-async def extract_audio(callback):
-    await callback.answer()
-
-    video = callback.message.video
-
-    if not video:
-        return
-
-    if video.file_size and video.file_size > MAX_VIDEO_BYTES:
-        await callback.message.answer(
-            get_text(callback.from_user.id)["video_large"]
-        )
-        return
-
-    if not ffmpeg_available():
-        await callback.message.answer(
-            get_text(callback.from_user.id)["ffmpeg"]
-        )
-        return
-
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    input_file = TEMP_DIR / f"extract_{callback.id}.mp4"
-    output_file = TEMP_DIR / f"extract_{callback.id}.mp3"
-
-    wait = await callback.message.answer(
-        get_text(callback.from_user.id)["wait"]
-    )
-
-    try:
-        await download_telegram_file(
-            video.file_id,
-            input_file
-        )
-
-        await run_ffmpeg([
-            "-i", str(input_file),
-            "-vn",
-            "-b:a", "192k",
-            str(output_file)
-        ])
-
-        if output_file.stat().st_size > MAX_AUDIO_BYTES:
-            await callback.message.answer(
-                get_text(callback.from_user.id)["audio_large"]
-            )
-            return
-
-        await callback.message.answer_audio(
-            FSInputFile(output_file)
-        )
-
-    except Exception:
-        logger.exception("MP3 extraction error")
-
-        await callback.message.answer(
-            get_text(callback.from_user.id)["error"]
-        )
-
-    finally:
-        await delete_message(wait)
-        await safe_delete(input_file)
-        await safe_delete(output_file)
-
-
-# ==================================================
-# ROUND BUTTON
-# ==================================================
-
-@dp.callback_query(F.data == "round")
-async def round_callback(callback):
-    await callback.answer()
-
-    video = callback.message.video
-
-    if video:
-        await create_round(
-            callback.message,
-            video.file_id,
-            f"button_{callback.id}",
-            video.file_size,
-            user_id=callback.from_user.id
-        )
-
-
-# ==================================================
+# =========================================================
 # AUDD MUSIC RECOGNITION
-# ==================================================
+# =========================================================
 
 async def recognize_music(message, file_id, file_size):
     user_id = message.from_user.id
-    t = get_text(user_id)
+    t = T(user_id)
 
     if not AUDD_TOKEN:
         await message.answer(t["no_audd"])
@@ -1360,8 +993,8 @@ async def recognize_music(message, file_id, file_size):
 
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    filename = TEMP_DIR / (
-        f"recognize_{user_id}_{message.message_id}.audio"
+    path = TEMP_DIR / (
+        f"recognize_{uuid.uuid4().hex}.audio"
     )
 
     wait = await message.answer(t["recognizing"])
@@ -1369,19 +1002,22 @@ async def recognize_music(message, file_id, file_size):
     try:
         await download_telegram_file(
             file_id,
-            filename
+            path
         )
 
-        if filename.stat().st_size > MAX_AUDIO_BYTES:
+        if path.stat().st_size > MAX_AUDIO_BYTES:
             await message.answer(t["audio_large"])
             return
 
         timeout = aiohttp.ClientTimeout(total=60)
 
-        with open(filename, "rb") as audio:
+        with open(path, "rb") as audio:
             form = aiohttp.FormData()
 
-            form.add_field("api_token", AUDD_TOKEN)
+            form.add_field(
+                "api_token",
+                AUDD_TOKEN
+            )
 
             form.add_field(
                 "file",
@@ -1411,12 +1047,16 @@ async def recognize_music(message, file_id, file_size):
             await message.answer(t["not_found"])
             return
 
-        title = result.get("title", "Unknown")
-        artist = result.get("artist", "Unknown")
+        title = result.get("title") or ""
+        artist = result.get("artist") or ""
+
+        if not title:
+            await message.answer(t["not_found"])
+            return
 
         await show_music_results(
             message,
-            f"{artist} {title}"
+            f"{artist} {title}".strip()
         )
 
     except Exception:
@@ -1425,7 +1065,192 @@ async def recognize_music(message, file_id, file_size):
 
     finally:
         await delete_message(wait)
-        await safe_delete(filename)
+        await safe_delete(path)
+
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+@dp.message(Command("start"))
+async def start_handler(message):
+    await message.answer(
+        T(message.from_user.id)["start"]
+    )
+
+
+@dp.message(Command("music"))
+async def music_handler(message):
+    await message.answer(
+        T(message.from_user.id)["music_help"]
+    )
+
+
+@dp.message(Command("video"))
+async def video_handler(message):
+    await message.answer(
+        T(message.from_user.id)["video_help"]
+    )
+
+
+@dp.message(Command("help"))
+async def help_handler(message):
+    t = T(message.from_user.id)
+
+    await message.answer(
+        "ℹ️ <b>AX MUSIC HELP</b>\n\n"
+        f"{t['music_help']}\n"
+        f"{t['video_help']}\n\n"
+        "/lang — Tilni almashtirish"
+    )
+
+
+# =========================================================
+# LANGUAGE
+# =========================================================
+
+@dp.message(Command("lang"))
+async def language_handler(message):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🇺🇿 Uzbek",
+                callback_data="lang_uz"
+            ),
+            InlineKeyboardButton(
+                text="🇷🇺 Russian",
+                callback_data="lang_ru"
+            ),
+            InlineKeyboardButton(
+                text="🇬🇧 English",
+                callback_data="lang_en"
+            )
+        ]]
+    )
+
+    await message.answer(
+        T(message.from_user.id)["language"],
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("lang_"))
+async def language_callback(callback):
+    language = callback.data.split("_", 1)[1]
+
+    if language not in TEXTS:
+        await callback.answer()
+        return
+
+    set_language(
+        callback.from_user.id,
+        language
+    )
+
+    await callback.answer("Language changed")
+
+    await callback.message.edit_text(
+        TEXTS[language]["start"]
+    )
+
+
+# =========================================================
+# VIDEO TO ROUND VIDEO
+# =========================================================
+
+async def create_round(message, file_id, file_size=0):
+    user_id = message.from_user.id
+    t = T(user_id)
+
+    if file_size and file_size > MAX_VIDEO_BYTES:
+        await message.answer(t["video_large"])
+        return
+
+    if not ffmpeg_available():
+        await message.answer(t["ffmpeg"])
+        return
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    prefix = uuid.uuid4().hex
+
+    input_file = TEMP_DIR / f"{prefix}_input.mp4"
+    output_file = TEMP_DIR / f"{prefix}_round.mp4"
+
+    wait = await message.answer(t["wait"])
+
+    try:
+        await download_telegram_file(
+            file_id,
+            input_file
+        )
+
+        if input_file.stat().st_size > MAX_VIDEO_BYTES:
+            await message.answer(t["video_large"])
+            return
+
+        await run_ffmpeg([
+            "-i", str(input_file),
+            "-t", str(MAX_VIDEO_SECONDS),
+            "-vf",
+            "crop='min(iw,ih)':'min(iw,ih)',"
+            "scale=384:384:force_original_aspect_ratio=decrease,"
+            "pad=384:384:(ow-iw)/2:(oh-ih)/2,"
+            "fps=30",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-movflags", "+faststart",
+            str(output_file)
+        ])
+
+        if not output_file.exists():
+            raise RuntimeError("Round video yaratilmadi")
+
+        await message.answer_video_note(
+            FSInputFile(output_file)
+        )
+
+    except Exception:
+        logger.exception("Round video error")
+        await message.answer(t["error"])
+
+    finally:
+        await delete_message(wait)
+        await safe_delete(input_file)
+        await safe_delete(output_file)
+
+
+@dp.message(F.video)
+async def video_handler_message(message):
+    await create_round(
+        message,
+        message.video.file_id,
+        message.video.file_size or 0
+    )
+
+
+# =========================================================
+# VIDEO TO MP3
+# =========================================================
+
+@dp.message(F.document)
+async def document_handler(message):
+    document = message.document
+
+    if not document.mime_type:
+        return
+
+    if not document.mime_type.startswith("audio/"):
+        return
+
+    await recognize_music(
+        message,
+        document.file_id,
+        document.file_size or 0
+    )
 
 
 @dp.message(F.voice)
@@ -1446,23 +1271,21 @@ async def audio_handler(message):
     )
 
 
-# ==================================================
-# SEARCH BY SONG TITLE
-# ==================================================
+# =========================================================
+# SEARCH BY TEXT
+# =========================================================
 
 @dp.message(F.text)
-async def search_song(message):
+async def text_search_handler(message):
     query = (message.text or "").strip()
 
-    if (
-        not query
-        or query.startswith("/")
-        or len(query) < 2
-        or len(query) > 150
-    ):
+    if not query:
         return
 
-    if re.match(r"^https?://", query, re.IGNORECASE):
+    if query.startswith("/"):
+        return
+
+    if len(query) < 2 or len(query) > 150:
         return
 
     await show_music_results(
@@ -1471,36 +1294,52 @@ async def search_song(message):
     )
 
 
-# ==================================================
-# RENDER HEALTH SERVER
-# ==================================================
+# =========================================================
+# HEALTH SERVER
+# =========================================================
 
-async def handle(request):
+async def health_handler(request):
     return web.json_response({
         "status": "ok",
-        "service": "AX MUSIC BOT"
+        "service": "AX MUSIC",
+        "version": "3.0"
     })
 
 
-# ==================================================
-# START BOT
-# ==================================================
+async def start_health_server():
+    app = web.Application()
+
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
+    await site.start()
+
+    logger.info(
+        "AX MUSIC health server started on %s",
+        PORT
+    )
+
+    return runner
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 async def main():
-    MUSIC_LIBRARY_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    TEMP_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    MUSIC_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 
     init_database()
 
@@ -1516,29 +1355,10 @@ async def main():
 
     if not ffmpeg_available():
         logger.warning(
-            "FFmpeg o'rnatilmagan!"
+            "FFmpeg o'rnatilmagan. Video funksiyasi ishlamaydi."
         )
 
-    app = web.Application()
-
-    app.router.add_get("/", handle)
-    app.router.add_get("/health", handle)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT
-    )
-
-    await site.start()
-
-    logger.info(
-        "Web server started on port %s",
-        PORT
-    )
+    runner = await start_health_server()
 
     logger.info("AX MUSIC BOT ishga tushdi!")
 
@@ -1555,4 +1375,4 @@ if __name__ == "__main__":
         asyncio.run(main())
 
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot to'xtatildi.")
+        logger.info("AX MUSIC stopped.")
