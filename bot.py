@@ -1,4 +1,4 @@
-import os, asyncio, logging, subprocess, aiohttp, imageio_ffmpeg, yt_dlp
+import os, glob, asyncio, logging, subprocess, aiohttp, imageio_ffmpeg, yt_dlp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -55,13 +55,24 @@ def dl_mp3(q, base):
         'outtmpl': f"{base}.%(ext)s",
         'default_search': 'scsearch1',
         'noplaylist': True,
-        'quiet': True,
-        'ffmpeg_location': FFMPEG,
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+        'quiet': True
     }
+    title = q
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(q, download=True)
-        return info['entries'][0].get('title', q) if 'entries' in info and info['entries'] else info.get('title', q)
+        if 'entries' in info and info['entries']:
+            title = info['entries'].get('title', q)
+        else:
+            title = info.get('title', q)
+            
+    files = glob.glob(f"{base}.*")
+    if files:
+        raw_file = files
+        final_mp3 = f"{base}_ready.mp3"
+        to_mp3(raw_file, final_mp3)
+        if os.path.exists(raw_file): os.remove(raw_file)
+        return title, final_mp3
+    return title, ""
 
 @dp.message(Command("start"))
 async def c_start(m: types.Message): await m.answer(gt(m.from_user.id)["start"], parse_mode="Markdown")
@@ -82,7 +93,7 @@ async def c_lang(m: types.Message):
 
 @dp.callback_query(F.data.startswith("l_"))
 async def cb_lang(c: types.CallbackQuery):
-    langs[c.from_user.id] = c.data.split("_")[-1]
+    langs[c.from_user.id] = c.data.split("_")
     await c.answer()
     await c.message.edit_text(gt(c.from_user.id)["set"], parse_mode="Markdown")
 
@@ -90,7 +101,8 @@ async def cb_lang(c: types.CallbackQuery):
 async def h_voice(m: types.Message):
     t = gt(m.from_user.id)
     w = await m.answer(t["wait"])
-    inp, base, outp = f"v_{m.message_id}.ogg", f"f_{m.message_id}", f"f_{m.message_id}.mp3"
+    inp, base = f"v_{m.message_id}.ogg", f"f_{m.message_id}"
+    outp = ""
     try:
         f = await bot.get_file((m.voice or m.audio).file_id)
         await bot.download_file(f.file_path, inp)
@@ -103,15 +115,16 @@ async def h_voice(m: types.Message):
                     res = await r.json()
         if res.get("status") == "success" and res.get("result"):
             title = f"{res['result'].get('artist', '')} - {res['result'].get('title', '')}".strip(" -")
-            await asyncio.to_thread(dl_mp3, title, base)
-            if os.path.exists(outp): await m.answer_audio(FSInputFile(outp), title=title, caption=f"🎶 {title}\n{t['cap_a']}")
+            title, outp = await asyncio.to_thread(dl_mp3, title, base)
+            if outp and os.path.exists(outp):
+                await m.answer_audio(FSInputFile(outp), title=title, caption=f"🎶 {title}\n{t['cap_a']}")
             else: await m.answer(t["err"])
         else: await m.answer(t["not_found"])
     except Exception: await m.answer(t["not_found"])
     finally:
         await w.delete()
         for x in (inp, outp):
-            if os.path.exists(x): os.remove(x)
+            if x and os.path.exists(x): os.remove(x)
 
 @dp.message(F.video)
 async def h_vid(m: types.Message):
@@ -151,15 +164,17 @@ async def h_link(m: types.Message):
 async def h_text(m: types.Message):
     t = gt(m.from_user.id)
     w = await m.answer(t["wait"])
-    base, outp = f"s_{m.message_id}", f"s_{m.message_id}.mp3"
+    base = f"s_{m.message_id}"
+    outp = ""
     try:
-        title = await asyncio.to_thread(dl_mp3, m.text.strip(), base)
-        if os.path.exists(outp): await m.answer_audio(FSInputFile(outp), title=title, caption=f"🎶 {title}\n{t['cap_a']}")
+        title, outp = await asyncio.to_thread(dl_mp3, m.text.strip(), base)
+        if outp and os.path.exists(outp):
+            await m.answer_audio(FSInputFile(outp), title=title, caption=f"🎶 {title}\n{t['cap_a']}")
         else: await m.answer(t["err"])
     except Exception: await m.answer(t["err"])
     finally:
         await w.delete()
-        if os.path.exists(outp): os.remove(outp)
+        if outp and os.path.exists(outp): os.remove(outp)
 
 @dp.callback_query(F.data.in_({"c_aud", "c_rnd"}))
 async def cb_media(c: types.CallbackQuery):
@@ -196,6 +211,3 @@ async def start_bg(app): asyncio.create_task(loop())
 
 if __name__ == "__main__":
     app = web.Application()
-    app.router.add_get("/", handle)
-    app.on_startup.append(start_bg)
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
