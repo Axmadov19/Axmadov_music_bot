@@ -2,12 +2,13 @@ import os
 import asyncio
 import logging
 import subprocess
+import base64
+import aiohttp
 import imageio_ffmpeg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from shazamio import Shazam
 import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -16,7 +17,6 @@ FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-shazam = Shazam()
 user_langs = {}
 
 TEXTS = {
@@ -34,7 +34,7 @@ TEXTS = {
         "wait_audio": "⏳ MP3 musiqa ajratilmoqda...",
         "caption_vid": "📥 @Pleyistbot orqali yuklandi!",
         "caption_aud": "🎵 @Pleyistbot orqali topildi!",
-        "not_found": "❌ Afsuski, bu ovoz orqali musiqa topilmadi. Aniqroq parcha yuboring yoki qo'shiq nomini yozing.",
+        "not_found": "❌ Ovoz orqali musiqa topilmadi. Aniqroq parcha yuboring yoki qo'shiq nomini yozing.",
         "err_vid": "❌ Videoni yuklab bo'lmadi (havola yopiq yoki hajmi 50MB dan katta).",
         "err_link": "❌ Havolani yuklashda xatolik yuz berdi.",
         "err_proc": "❌ Qayta ishlashda xatolik yuz berdi."
@@ -53,7 +53,7 @@ TEXTS = {
         "wait_audio": "⏳ Извлечение MP3 музыки...",
         "caption_vid": "📥 Скачано через @Pleyistbot!",
         "caption_aud": "🎵 Найдено через @Pleyistbot!",
-        "not_found": "❌ К сожалению, музыка не распознана. Попробуйте другой отрывок или напишите название.",
+        "not_found": "❌ Музыка не распознана. Попробуйте другой отрывок или напишите название.",
         "err_vid": "❌ Не удалось скачать видео (закрытый аккаунт или размер > 50МБ).",
         "err_link": "❌ Ошибка при загрузке по ссылке.",
         "err_proc": "❌ Произошла ошибка."
@@ -115,6 +115,34 @@ def search_and_download_mp3(query: str, out_base: str) -> str:
             return info['entries'][0].get('title', query)
         return info.get('title', query)
 
+async def recognize_audio_shazam(ogg_path: str) -> str:
+    raw_path = f"{ogg_path}.raw"
+    try:
+        cmd = [FFMPEG_BIN, "-y", "-i", ogg_path, "-t", "5", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", raw_path]
+        await asyncio.to_thread(subprocess.run, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.exists(raw_path):
+            return ""
+        with open(raw_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+        
+        url = "https://rapidapi.com"
+        # Agar RapidAPI kalit bo'lmasa, ochiq AudD demo API orqali tekshiramiz
+        async with aiohttp.ClientSession() as session:
+            data = aiohttp.FormData()
+            data.add_field("api_token", "test")
+            data.add_field("file", open(ogg_path, "rb"), filename="voice.ogg")
+            async with session.post("https://audd.io", data=data, timeout=15) as resp:
+                res = await resp.json()
+                if res.get("status") == "success" and res.get("result"):
+                    r = res["result"]
+                    return f"{r.get('artist', '')} - {r.get('title', '')}".strip(" -")
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+    return ""
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(get_t(message.from_user.id)["start"], parse_mode="Markdown")
@@ -146,7 +174,7 @@ async def callback_set_lang(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.edit_text(get_t(callback.from_user.id)["lang_set"], parse_mode="Markdown")
 
-# Ovozli xabar (golos) yoki audio tashlanganda musiqani aniqlash (Shazam) va yuklash
+# Ovozli xabar (golos) yoki audio tashlanganda musiqani aniqlash va yuklash
 @dp.message(F.voice | F.audio)
 async def recognize_and_send_music(message: types.Message):
     t = get_t(message.from_user.id)
@@ -160,36 +188,3 @@ async def recognize_and_send_music(message: types.Message):
         file = await bot.get_file(media.file_id)
         await bot.download_file(file.file_path, in_audio)
         
-        res = await shazam.recognize(in_audio)
-        track = res.get("track")
-        
-        if not track:
-            await message.answer(t["not_found"])
-            return
-            
-        song_title = f"{track.get('subtitle', '')} - {track.get('title', '')}".strip(" -")
-        await wait_msg.edit_text(f"🎶 **{song_title}**\n{t['wait_music']}", parse_mode="Markdown")
-        
-        await asyncio.to_thread(search_and_download_mp3, song_title, out_base)
-        
-        if os.path.exists(out_mp3):
-            await message.answer_audio(
-                FSInputFile(out_mp3),
-                title=song_title,
-                caption=f"🎶 **{song_title}**\n{t['caption_aud']}",
-                parse_mode="Markdown"
-            )
-        else:
-            await message.answer(t["err_proc"])
-    except Exception:
-        await message.answer(t["not_found"])
-    finally:
-        await wait_msg.delete()
-        for f in (in_audio, out_mp3):
-            if os.path.exists(f): os.remove(f)
-
-# Oddiy video yuborilganda Dumaloq video qilish
-@dp.message(F.video)
-async def make_round_direct(message: types.Message):
-    t = get_t(message.from_user.id)
-    wait_msg = await message.answer(t["wait_round"])
