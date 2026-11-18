@@ -3,25 +3,25 @@ import logging
 import os
 import re
 import glob
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import BotCommand, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 
 # ==========================================
-# SOZLAMALAR
+# ASOSIY SOZLAMALAR
 # ==========================================
-BOT_TOKEN = "SIZNING_BOT_TOKENINGIZ"  # BotFather dan olingan tokenni shu yerga qo'ying
-BOT_USERNAME = "@Axmadov_music_bot"   # Botingiz usernami
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_BOT_TOKENINGIZ")
+BOT_USERNAME = "@Axmadov_music_bot"
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Foydalanuvchi holatlari (til, rejim, faol jarayon)
-user_lang = {}      # {user_id: 'uz' | 'ru' | 'en'}
-user_mode = {}      # {user_id: 'music' | 'video'}
-active_tasks = {}   # {user_id: True | False}
+user_lang = {}
+user_mode = {}
+active_tasks = {}
 
 # ==========================================
 # KO'P TILLI MATNLAR LUG'ATI
@@ -90,7 +90,7 @@ async def set_bot_commands(bot: Bot):
     await bot.set_my_commands(commands)
 
 # ==========================================
-# BUYRUQLAR (COMMANDS)
+# BUYRUQLAR HANDLERLARI
 # ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -153,8 +153,6 @@ def download_video_sync(url: str, base_filename: str):
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        # Instagram uchun cookie kerak bo'lsa pastdagi qatorni oching:
-        # 'cookiefile': 'cookies.txt',
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -190,14 +188,14 @@ def cleanup_files(pattern: str):
             pass
 
 # ==========================================
-# ASOSIY XABARLARNI QAYTA ISHLASH
+# XABARLARNI QAYTA ISHLASH
 # ==========================================
 @dp.message(F.text)
 async def handle_messages(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # Agar xabar ichida havola (URL) bo'lsa -> Video yuklaymiz
+    # Havola yuborilganda -> Video yuklash
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         url = url_match.group(0)
@@ -207,17 +205,27 @@ async def handle_messages(message: types.Message):
 
         try:
             filepath = await asyncio.to_thread(download_video_sync, url, base_name)
-
             if not active_tasks.get(user_id):
                 cleanup_files(base_name)
                 return
 
             if os.path.exists(filepath):
                 video_file = FSInputFile(filepath)
-                await message.answer_video(
-                    video=video_file,
-                    caption=f"✅ {BOT_USERNAME}"
-                )
+                await message.answer_video(video=video_file, caption=f"✅ {BOT_USERNAME}")
             else:
                 await message.answer(get_text(user_id, "error"))
         except Exception as e:
+            logging.error(f"Video yuklash xatosi: {e}")
+            if active_tasks.get(user_id):
+                await message.answer(get_text(user_id, "error"))
+        finally:
+            active_tasks[user_id] = False
+            cleanup_files(base_name)
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+        return
+
+    # Matn yuborilganda -> Musiqa qidirish
+    active_tasks[user_id] = True
