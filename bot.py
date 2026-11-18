@@ -6,22 +6,26 @@ import subprocess
 import unicodedata
 import sqlite3
 import shutil
+import uuid
+import html
 
 from pathlib import Path
 from urllib.parse import urlparse
+from difflib import SequenceMatcher
 
 import aiohttp
 import yt_dlp
 
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     FSInputFile,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
 )
+from aiogram.exceptions import TelegramBadRequest
 
 
 # ==================================================
@@ -40,6 +44,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MUSIC_LIBRARY_DIR = BASE_DIR / "music_library"
 DATA_DIR = BASE_DIR / "data"
 TEMP_DIR = BASE_DIR / "tmp"
+
 DATABASE_PATH = DATA_DIR / "bot.sqlite3"
 
 MAX_VIDEO_BYTES = 48 * 1024 * 1024
@@ -51,6 +56,9 @@ AUDIO_EXTENSIONS = {
     ".ogg", ".wav", ".flac"
 }
 
+PAGE_SIZE = 4
+MAX_SEARCH_RESULTS = 12
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -60,6 +68,12 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Qidiruv natijalari
+SEARCH_CACHE = {}
+
+# Telegram video xabarlari uchun vaqtinchalik ma'lumot
+VIDEO_CACHE = {}
 
 
 # ==================================================
@@ -80,6 +94,7 @@ TEXTS = {
         ),
         "wait": "⏳ Kuting...",
         "recognizing": "🎧 Qo‘shiq aniqlanmoqda...",
+        "searching": "🔎 Musiqa qidirilmoqda...",
         "not_found": "😔 Qo‘shiq topilmadi.",
         "not_library": (
             "Qo‘shiq aniqlandi, lekin to‘liq audio "
@@ -95,6 +110,14 @@ TEXTS = {
         "video_ready": "📥 Video tayyor!",
         "music_help": "🎵 Qo‘shiq nomini yozing yoki audio yuboring.",
         "video_help": "🎬 Video havolasini yuboring yoki video jo‘nating.",
+        "results": "🎧 <b>AX MUSIC QIDIRUV</b>",
+        "match": "Moslik",
+        "page": "Sahifa",
+        "play": "▶️ Tinglash",
+        "expired": "Qidiruv muddati tugagan. Qaytadan qidiring.",
+        "no_preview": "Bu qo‘shiq uchun tinglash namunasi mavjud emas.",
+        "preview": "30 soniyalik tinglash namunasi",
+        "ffmpeg": "FFmpeg o‘rnatilmagan.",
     },
 
     "ru": {
@@ -109,6 +132,7 @@ TEXTS = {
         ),
         "wait": "⏳ Подождите...",
         "recognizing": "🎧 Определяю песню...",
+        "searching": "🔎 Ищем музыку...",
         "not_found": "😔 Песня не найдена.",
         "not_library": "Песня найдена, но аудио отсутствует в библиотеке:",
         "error": "❌ Произошла ошибка.",
@@ -121,6 +145,14 @@ TEXTS = {
         "video_ready": "📥 Видео готово!",
         "music_help": "🎵 Отправьте название песни или аудио.",
         "video_help": "🎬 Отправьте ссылку или видео.",
+        "results": "🎧 <b>AX MUSIC ПОИСК</b>",
+        "match": "Совпадение",
+        "page": "Страница",
+        "play": "▶️ Слушать",
+        "expired": "Срок поиска истёк. Попробуйте снова.",
+        "no_preview": "Для этой песни нет доступного фрагмента.",
+        "preview": "30-секундный фрагмент",
+        "ffmpeg": "FFmpeg не установлен.",
     },
 
     "en": {
@@ -135,18 +167,27 @@ TEXTS = {
         ),
         "wait": "⏳ Please wait...",
         "recognizing": "🎧 Identifying song...",
+        "searching": "🔎 Searching for music...",
         "not_found": "😔 Song not found.",
         "not_library": "Song found, but audio is not in our library:",
         "error": "❌ An error occurred.",
         "no_audd": "AudD token is not configured.",
         "no_song": "Song not found in library.",
-        "language": "Choose language:",
+        "language": "Choose a language:",
         "audio_large": "Audio file is too large.",
         "video_large": "Video file is too large.",
         "bad_url": "Invalid URL.",
         "video_ready": "📥 Video ready!",
         "music_help": "🎵 Send a song title or audio.",
         "video_help": "🎬 Send a video link or video file.",
+        "results": "🎧 <b>AX MUSIC SEARCH</b>",
+        "match": "Match",
+        "page": "Page",
+        "play": "▶️ Listen",
+        "expired": "Search expired. Please search again.",
+        "no_preview": "No preview is available for this song.",
+        "preview": "30-second preview",
+        "ffmpeg": "FFmpeg is not installed.",
     }
 }
 
@@ -216,6 +257,25 @@ def normalize(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def calculate_match(query, title, artist=""):
+    query = normalize(query)
+    target = normalize(f"{title} {artist}")
+
+    if not query or not target:
+        return 0
+
+    score = SequenceMatcher(None, query, target).ratio()
+
+    query_words = set(query.split())
+    target_words = set(target.split())
+
+    if query_words:
+        overlap = len(query_words & target_words) / len(query_words)
+        score = max(score, overlap)
+
+    return min(100, round(score * 100))
+
+
 def find_song(query):
     if not MUSIC_LIBRARY_DIR.exists():
         return None
@@ -240,14 +300,19 @@ def find_song(query):
         if query == filename:
             return file
 
+        score = SequenceMatcher(None, query, filename).ratio()
+
         if query in filename or filename in query:
-            score = min(len(query), len(filename))
+            score = max(score, 0.9)
 
-            if score > best_score:
-                best_match = file
-                best_score = score
+        if score > best_score:
+            best_match = file
+            best_score = score
 
-    return best_match
+    if best_score >= 0.45:
+        return best_match
+
+    return None
 
 
 async def send_song(message, title, artist=""):
@@ -276,7 +341,7 @@ async def delete_message(message):
 
 async def safe_delete(path):
     try:
-        if path.exists():
+        if path and path.exists():
             await asyncio.to_thread(path.unlink)
     except OSError:
         logger.warning("Faylni o‘chirishda xatolik: %s", path)
@@ -306,6 +371,327 @@ async def download_telegram_file(file_id, destination):
         file.file_path,
         destination=destination
     )
+
+
+# ==================================================
+# ITUNES MUSIQA QIDIRISH
+# ==================================================
+
+async def search_itunes(query):
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            "https://itunes.apple.com/search",
+            params={
+                "term": query,
+                "entity": "song",
+                "limit": MAX_SEARCH_RESULTS
+            }
+        ) as response:
+
+            response.raise_for_status()
+            data = await response.json(content_type=None)
+
+    results = []
+
+    for item in data.get("results", []):
+        title = item.get("trackName", "Unknown")
+        artist = item.get("artistName", "Unknown")
+
+        results.append({
+            "title": title,
+            "artist": artist,
+            "album": item.get("collectionName", ""),
+            "preview": item.get("previewUrl"),
+            "link": item.get("trackViewUrl"),
+            "artwork": item.get("artworkUrl100"),
+            "score": calculate_match(query, title, artist)
+        })
+
+    results.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return results
+
+
+def make_music_keyboard(search_id, page, results):
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+
+    current = results[start:end]
+    rows = []
+
+    for index, song in enumerate(current, start=start):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"▶️ {song['title'][:28]}",
+                callback_data=f"play:{search_id}:{index}"
+            )
+        ])
+
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"page:{search_id}:{page - 1}"
+            )
+        )
+
+    if end < len(results):
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"page:{search_id}:{page + 1}"
+            )
+        )
+
+    if navigation:
+        rows.append(navigation)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def make_results_text(query, results, page, user_id):
+    t = get_text(user_id)
+
+    start = page * PAGE_SIZE
+    current = results[start:start + PAGE_SIZE]
+
+    safe_query = html.escape(query)
+
+    text = (
+        f"{t['results']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🔎 <b>{safe_query}</b>\n\n"
+    )
+
+    for number, song in enumerate(current, start=start + 1):
+        title = html.escape(song["title"])
+        artist = html.escape(song["artist"])
+        score = song["score"]
+
+        text += (
+            f"<b>{number}. {title}</b>\n"
+            f"👤 {artist}\n"
+            f"🎯 {t['match']}: <b>{score}%</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    total_pages = max(
+        1,
+        (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
+    )
+
+    text += f"\n📄 {t['page']}: {page + 1}/{total_pages}"
+    text += "\n\n<i>Qo‘shiqni tinglash uchun ▶️ tugmasini bosing.</i>"
+
+    return text
+
+
+async def show_music_results(message, query):
+    user_id = message.from_user.id
+    t = get_text(user_id)
+
+    wait = await message.answer(t["searching"])
+
+    try:
+        results = await search_itunes(query)
+
+        if not results:
+            await wait.edit_text(t["not_found"])
+            return
+
+        search_id = uuid.uuid4().hex[:10]
+
+        SEARCH_CACHE[search_id] = {
+            "query": query,
+            "results": results
+        }
+
+        # Kesh hajmini cheklash
+        if len(SEARCH_CACHE) > 100:
+            first_key = next(iter(SEARCH_CACHE))
+            SEARCH_CACHE.pop(first_key, None)
+
+        text = make_results_text(
+            query,
+            results,
+            0,
+            user_id
+        )
+
+        keyboard = make_music_keyboard(
+            search_id,
+            0,
+            results
+        )
+
+        await wait.edit_text(
+            text,
+            reply_markup=keyboard
+        )
+
+    except Exception:
+        logger.exception("Music search error")
+        await wait.edit_text(t["error"])
+
+
+# ==================================================
+# MUSIQA SAHIFALASH
+# ==================================================
+
+@dp.callback_query(F.data.startswith("page:"))
+async def page_callback(callback):
+    try:
+        _, search_id, page_text = callback.data.split(":")
+        page = int(page_text)
+
+        cached = SEARCH_CACHE.get(search_id)
+
+        if not cached:
+            await callback.answer(
+                get_text(callback.from_user.id)["expired"],
+                show_alert=True
+            )
+            return
+
+        results = cached["results"]
+        query = cached["query"]
+
+        text = make_results_text(
+            query,
+            results,
+            page,
+            callback.from_user.id
+        )
+
+        keyboard = make_music_keyboard(
+            search_id,
+            page,
+            results
+        )
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard
+        )
+
+        await callback.answer()
+
+    except Exception:
+        logger.exception("Pagination error")
+        await callback.answer("Xatolik yuz berdi.", show_alert=True)
+
+
+# ==================================================
+# MUSIQANI IJRO ETISH
+# ==================================================
+
+async def download_preview(url, destination):
+    if not url:
+        return False
+
+    timeout = aiohttp.ClientTimeout(total=40)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return False
+
+                content = await response.read()
+
+                if len(content) > MAX_AUDIO_BYTES:
+                    return False
+
+                destination.write_bytes(content)
+
+        return destination.exists()
+
+    except Exception:
+        logger.exception("Preview download error")
+        return False
+
+
+@dp.callback_query(F.data.startswith("play:"))
+async def play_callback(callback):
+    try:
+        _, search_id, index_text = callback.data.split(":")
+        index = int(index_text)
+
+        cached = SEARCH_CACHE.get(search_id)
+
+        if not cached:
+            await callback.answer(
+                get_text(callback.from_user.id)["expired"],
+                show_alert=True
+            )
+            return
+
+        results = cached["results"]
+
+        if index < 0 or index >= len(results):
+            await callback.answer("Qo‘shiq topilmadi.")
+            return
+
+        song = results[index]
+
+        await callback.answer("Musiqa tayyorlanmoqda...")
+
+        # Avval o‘z kutubxonamizdan qidiramiz
+        local_file = (
+            find_song(f"{song['artist']} {song['title']}")
+            or find_song(song["title"])
+        )
+
+        if local_file:
+            await callback.message.answer_audio(
+                FSInputFile(local_file),
+                title=song["title"][:64],
+                performer=song["artist"][:64]
+            )
+            return
+
+        # Kutubxonada bo‘lmasa, qisqa preview
+        if not song.get("preview"):
+            await callback.message.answer(
+                get_text(callback.from_user.id)["no_preview"]
+            )
+            return
+
+        path = TEMP_DIR / f"preview_{uuid.uuid4().hex}.m4a"
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        try:
+            success = await download_preview(
+                song["preview"],
+                path
+            )
+
+            if not success:
+                await callback.message.answer("Audio yuklab olinmadi.")
+                return
+
+            await callback.message.answer_audio(
+                FSInputFile(path),
+                title=song["title"][:64],
+                performer=song["artist"][:64],
+                caption=get_text(callback.from_user.id)["preview"]
+            )
+
+        finally:
+            await safe_delete(path)
+
+    except Exception:
+        logger.exception("Play callback error")
+        await callback.message.answer(
+            get_text(callback.from_user.id)["error"]
+        )
 
 
 # ==================================================
@@ -339,7 +725,7 @@ async def help_handler(message):
     t = get_text(user_id)
 
     await message.answer(
-        "ℹ️ Yordam:\n\n"
+        "ℹ️ <b>Yordam:</b>\n\n"
         f"{t['music_help']}\n"
         f"{t['video_help']}\n"
         "/lang - Tilni o‘zgartirish"
@@ -396,8 +782,16 @@ async def language_callback(callback):
 # DUMALOQ VIDEO
 # ==================================================
 
-async def create_round(message, file_id, prefix, file_size=None):
-    user_id = message.from_user.id
+async def create_round(
+    message,
+    file_id,
+    prefix,
+    file_size=None,
+    user_id=None
+):
+    if user_id is None:
+        user_id = message.from_user.id
+
     t = get_text(user_id)
 
     if file_size and file_size > MAX_VIDEO_BYTES:
@@ -405,7 +799,7 @@ async def create_round(message, file_id, prefix, file_size=None):
         return
 
     if not ffmpeg_available():
-        await message.answer("FFmpeg o‘rnatilmagan.")
+        await message.answer(t["ffmpeg"])
         return
 
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -416,7 +810,10 @@ async def create_round(message, file_id, prefix, file_size=None):
     wait = await message.answer(t["wait"])
 
     try:
-        await download_telegram_file(file_id, input_file)
+        await download_telegram_file(
+            file_id,
+            input_file
+        )
 
         if input_file.stat().st_size > MAX_VIDEO_BYTES:
             await message.answer(t["video_large"])
@@ -503,20 +900,6 @@ async def url_message(message):
     )
 
     wait = await message.answer(t["wait"])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="🎵 MP3",
-                callback_data="extract"
-            ),
-            InlineKeyboardButton(
-                text="🎥 Round",
-                callback_data="round"
-            )
-        ]]
-    )
-
     downloaded_path = None
 
     try:
@@ -535,6 +918,19 @@ async def url_message(message):
             await message.answer(t["video_large"])
             return
 
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🎵 MP3",
+                    callback_data="extract"
+                ),
+                InlineKeyboardButton(
+                    text="🎥 Round",
+                    callback_data="round"
+                )
+            ]]
+        )
+
         await message.answer_video(
             FSInputFile(downloaded_path),
             caption=t["video_ready"],
@@ -551,6 +947,7 @@ async def url_message(message):
         if downloaded_path:
             await safe_delete(downloaded_path)
 
+        # yt-dlp yaratgan qo‘shimcha fayllarni ham tozalash
         for candidate in TEMP_DIR.glob(
             f"video_{message.from_user.id}_{message.message_id}.*"
         ):
@@ -577,7 +974,9 @@ async def extract_audio(callback):
         return
 
     if not ffmpeg_available():
-        await callback.message.answer("FFmpeg o‘rnatilmagan.")
+        await callback.message.answer(
+            get_text(callback.from_user.id)["ffmpeg"]
+        )
         return
 
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -601,6 +1000,12 @@ async def extract_audio(callback):
             "-b:a", "192k",
             str(output_file)
         ])
+
+        if output_file.stat().st_size > MAX_AUDIO_BYTES:
+            await callback.message.answer(
+                get_text(callback.from_user.id)["audio_large"]
+            )
+            return
 
         await callback.message.answer_audio(
             FSInputFile(output_file)
@@ -634,7 +1039,8 @@ async def round_callback(callback):
             callback.message,
             video.file_id,
             f"button_{callback.id}",
-            video.file_size
+            video.file_size,
+            user_id=callback.from_user.id
         )
 
 
@@ -663,7 +1069,10 @@ async def recognize_music(message, file_id, file_size):
     wait = await message.answer(t["recognizing"])
 
     try:
-        await download_telegram_file(file_id, filename)
+        await download_telegram_file(
+            file_id,
+            filename
+        )
 
         if filename.stat().st_size > MAX_AUDIO_BYTES:
             await message.answer(t["audio_large"])
@@ -705,6 +1114,7 @@ async def recognize_music(message, file_id, file_size):
         artist = result.get("artist", "Unknown")
         album = result.get("album", "")
 
+        # Kutubxonadan topilsa, audio yuboriladi
         sent = await send_song(
             message,
             title,
@@ -717,17 +1127,17 @@ async def recognize_music(message, file_id, file_size):
         link = result.get("song_link", "")
 
         text = (
-            f"🎵 {title}\n"
-            f"🎤 {artist}\n"
+            f"🎵 <b>{html.escape(title)}</b>\n"
+            f"🎤 {html.escape(artist)}\n"
         )
 
         if album:
-            text += f"💿 {album}\n"
+            text += f"💿 {html.escape(album)}\n"
 
         text += f"\n{t['not_library']}"
 
         if link:
-            text += f"\n{link}"
+            text += f"\n🔗 {html.escape(link)}"
 
         await message.answer(text)
 
@@ -762,28 +1172,6 @@ async def audio_handler(message):
 # QO‘SHIQ NOMI BILAN QIDIRISH
 # ==================================================
 
-async def search_itunes(query):
-    timeout = aiohttp.ClientTimeout(total=30)
-
-    async with aiohttp.ClientSession(
-        timeout=timeout
-    ) as session:
-
-        async with session.get(
-            "https://itunes.apple.com/search",
-            params={
-                "term": query,
-                "entity": "song",
-                "limit": 5
-            }
-        ) as response:
-
-            response.raise_for_status()
-            data = await response.json(content_type=None)
-
-    return data.get("results", [])
-
-
 @dp.message(F.text)
 async def search_song(message):
     query = (message.text or "").strip()
@@ -796,59 +1184,11 @@ async def search_song(message):
     ):
         return
 
-    t = get_text(message.from_user.id)
-    wait = await message.answer(t["wait"])
+    # Havolalar video handler orqali ishlanadi
+    if re.match(r"^https?://", query, re.IGNORECASE):
+        return
 
-    try:
-        file = find_song(query)
-
-        if file:
-            await message.answer_audio(FSInputFile(file))
-            return
-
-        results = await search_itunes(query)
-
-        if not results:
-            await message.answer(t["no_song"])
-            return
-
-        song = results[0]
-
-        title = song.get("trackName", query)
-        artist = song.get("artistName", "")
-        album = song.get("collectionName", "")
-        link = song.get("trackViewUrl", "")
-
-        sent = await send_song(
-            message,
-            title,
-            artist
-        )
-
-        if sent:
-            return
-
-        text = (
-            f"🎵 {title}\n"
-            f"🎤 {artist}\n"
-        )
-
-        if album:
-            text += f"💿 {album}\n"
-
-        text += f"\n{t['not_library']}"
-
-        if link:
-            text += f"\n{link}"
-
-        await message.answer(text)
-
-    except Exception:
-        logger.exception("Song search error")
-        await message.answer(t["error"])
-
-    finally:
-        await delete_message(wait)
+    await show_music_results(message, query)
 
 
 # ==================================================
