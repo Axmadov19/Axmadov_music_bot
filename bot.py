@@ -50,7 +50,15 @@ def to_mp3(inp, outp):
     subprocess.run([FFMPEG, "-y", "-i", inp, "-vn", "-ab", "192k", "-ar", "44100", outp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def dl_mp3(q, base):
-    opts = {'format': 'bestaudio/best', 'outtmpl': f"{base}.%(ext)s", 'default_search': 'ytsearch1', 'noplaylist': True, 'quiet': True, 'ffmpeg_location': FFMPEG, 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]}
+    opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': f"{base}.%(ext)s",
+        'default_search': 'scsearch1',
+        'noplaylist': True,
+        'quiet': True,
+        'ffmpeg_location': FFMPEG,
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(q, download=True)
         return info['entries'][0].get('title', q) if 'entries' in info and info['entries'] else info.get('title', q)
@@ -74,7 +82,7 @@ async def c_lang(m: types.Message):
 
 @dp.callback_query(F.data.startswith("l_"))
 async def cb_lang(c: types.CallbackQuery):
-    langs[c.from_user.id] = c.data.split("_")[1]
+    langs[c.from_user.id] = c.data.split("_")[-1]
     await c.answer()
     await c.message.edit_text(gt(c.from_user.id)["set"], parse_mode="Markdown")
 
