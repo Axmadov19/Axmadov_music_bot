@@ -1,232 +1,732 @@
-import asyncio
-import logging
+
 import os
 import re
-import glob
-import sys
+import asyncio
+import logging
+import subprocess
+import unicodedata
+from pathlib import Path
+
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 import yt_dlp
 
+
 # ==========================================
-# LOGGING VA TOKEN SOZLAMALARI
+#              SOZLAMALAR
 # ==========================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+AUDD_TOKEN = os.getenv("AUDD_TOKEN")
+PORT = int(os.getenv("PORT", "8080"))
+
+MUSIC_LIBRARY_DIR = Path("music_library")
+
+MAX_VIDEO_BYTES = 48 * 1024 * 1024
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi!")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
-# Tokenni Render Environment'dan yoki shu yerdan oladi
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_BOT_TOKENINGIZ").strip()
-BOT_USERNAME = "@Axmadov_music_bot"
-
-if not BOT_TOKEN or BOT_TOKEN == "SIZNING_BOT_TOKENINGIZ":
-    logging.error("XATO: BOT_TOKEN kiritilmagan! Tokenni kodga yoki Render Environment'ga qo'ying.")
-    sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-user_lang = {}
-user_mode = {}
-active_tasks = {}
+user_langs = {}
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".m4a", ".aac",
+    ".ogg", ".wav", ".flac"
+}
+
 
 # ==========================================
-# KO'P TILLI MATNLAR LUG'ATI
+#                  TILLAR
 # ==========================================
+
 TEXTS = {
     "uz": {
-        "start": "👋 Assalomu alaykum! Botga xush kelibsiz.\n\n📥 **Video yuklash:** Instagram, TikTok yoki YouTube havolasini yuboring.\n🎵 **Musiqa yuklash:** Qo'shiq nomi yoki ijrochi ismini yozing.",
-        "music": "🎵 **Musiqa platformasi**\n\nQidirayotgan qo'shiq nomi yoki ijrochi ismini yozib yuboring:",
-        "video": "🎬 **Video xizmatlari**\n\nInstagram Reels, TikTok yoki YouTube havolasini yuboring:",
-        "help": "ℹ️ **Yordam bo'limi**\n\n1️⃣ Video yuklash uchun havolani (link) shunchaki chatga tashlang.\n2️⃣ Musiqa topish uchun qo'shiq nomini yozing.\n3️⃣ Jarayonni bekor qilish uchun /stop buyrug'ini bosing.",
-        "lang_select": "🌐 Tilni tanlang / Выберите язык / Choose language:",
-        "lang_changed": "✅ Til O'zbek tiliga o'zgartirildi.",
-        "stop_ok": "🛑 Joriy jarayon to'xtatildi.",
-        "stop_none": "ℹ️ Hozirda faol jarayon mavjud emas.",
-        "downloading_video": "⏳ Video yuklanmoqda, biroz kuting...",
-        "searching_music": "🔎 Musiqa qidirilmoqda va yuklanmoqda...",
-        "error": "❌ Xatolik yuz berdi. Havola noto'g'ri, profil yopiq yoki fayl hajmi 50MB dan katta.",
-        "not_found": "❌ Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring."
+        "start": (
+            "👋 Assalomu alaykum!\n\n"
+            "🎵 Qo‘shiq nomini yozing yoki ovozli parcha yuboring.\n"
+            "🎬 Video havolasini yuboring.\n"
+            "🎥 Video yuborsangiz, dumaloq video qilib beraman.\n\n"
+            "/music - Musiqa\n"
+            "/video - Video\n"
+            "/help - Yordam\n"
+            "/lang - Til"
+        ),
+        "wait": "⏳ Kuting...",
+        "recognizing": "🎧 Qo‘shiq aniqlanmoqda...",
+        "not_found": "😔 Qo‘shiq topilmadi.",
+        "not_library": (
+            "Qo‘shiq aniqlandi, lekin to‘liq audio "
+            "ruxsatli kutubxonamizda mavjud emas:"
+        ),
+        "error": "❌ Xatolik yuz berdi.",
+        "no_audd": "AudD token sozlanmagan.",
+        "no_song": "Kutubxonada bu qo‘shiq topilmadi.",
+        "language": "Tilni tanlang:"
     },
+
     "ru": {
-        "start": "👋 Здравствуйте! Добро пожаловать в бот.\n\n📥 **Скачать видео:** Отправьте ссылку из Instagram, TikTok или YouTube.\n🎵 **Скачать музыку:** Напишите название песни или имя исполнителя.",
-        "music": "🎵 **Музыкальная платформа**\n\nНапишите название песни или имя исполнителя:",
-        "video": "🎬 **Видео сервисы**\n\nОтправьте ссылку на Instagram Reels, TikTok или YouTube:",
-        "help": "ℹ️ **Раздел помощи**\n\n1️⃣ Чтобы скачать видео, просто отправьте ссылку в чат.\n2️⃣ Чтобы найти музыку, напишите название трека.\n3️⃣ Для отмены процесса нажмите /stop.",
-        "lang_select": "🌐 Выберите язык:",
-        "lang_changed": "✅ Язык изменен на Русский.",
-        "stop_ok": "🛑 Текущий процесс остановлен.",
-        "stop_none": "ℹ️ Активных процессов нет.",
-        "downloading_video": "⏳ Видео загружается, пожалуйста подождите...",
-        "searching_music": "🔎 Поиск и загрузка музыки...",
-        "error": "❌ Произошла ошибка. Неверная ссылка, закрытый аккаунт или файл больше 50МБ.",
-        "not_found": "❌ Ничего не найдено. Попробуйте другое название."
+        "start": (
+            "👋 Добро пожаловать!\n\n"
+            "Отправьте название песни, аудио или ссылку на видео.\n"
+            "/music - Музыка\n"
+            "/video - Видео\n"
+            "/help - Помощь\n"
+            "/lang - Язык"
+        ),
+        "wait": "⏳ Подождите...",
+        "recognizing": "🎧 Определяю песню...",
+        "not_found": "😔 Песня не найдена.",
+        "not_library": (
+            "Песня определена, но полного аудио "
+            "нет в нашей библиотеке:"
+        ),
+        "error": "❌ Произошла ошибка.",
+        "no_audd": "AudD token не настроен.",
+        "no_song": "Песня не найдена в библиотеке.",
+        "language": "Выберите язык:"
     },
+
     "en": {
-        "start": "👋 Hello! Welcome to the bot.\n\n📥 **Download Video:** Send an Instagram, TikTok, or YouTube link.\n🎵 **Download Music:** Type a song title or artist name.",
-        "music": "🎵 **Music Platform**\n\nType the song title or artist name you are looking for:",
-        "video": "🎬 **Video Services**\n\nSend an Instagram Reels, TikTok, or YouTube link:",
-        "help": "ℹ️ **Help Section**\n\n1️⃣ Just paste a link to download a video.\n2️⃣ Type a song name to search and download MP3.\n3️⃣ Use /stop to cancel an active process.",
-        "lang_select": "🌐 Choose language:",
-        "lang_changed": "✅ Language changed to English.",
-        "stop_ok": "🛑 Current process stopped.",
-        "stop_none": "ℹ️ No active process found.",
-        "downloading_video": "⏳ Downloading video, please wait...",
-        "searching_music": "🔎 Searching and downloading music...",
-        "error": "❌ An error occurred. Invalid link, private account, or file exceeds 50MB.",
-        "not_found": "❌ Nothing found. Try another search query."
+        "start": (
+            "👋 Welcome!\n\n"
+            "Send a song title, audio snippet or video link.\n"
+            "/music - Music\n"
+            "/video - Video\n"
+            "/help - Help\n"
+            "/lang - Language"
+        ),
+        "wait": "⏳ Please wait...",
+        "recognizing": "🎧 Identifying song...",
+        "not_found": "😔 Song not found.",
+        "not_library": (
+            "Song identified, but full audio "
+            "is not in our library:"
+        ),
+        "error": "❌ An error occurred.",
+        "no_audd": "AudD token is not configured.",
+        "no_song": "Song not found in library.",
+        "language": "Choose language:"
     }
 }
 
-def get_text(user_id: int, key: str) -> str:
-    lang = user_lang.get(user_id, "uz")
-    return TEXTS[lang][key]
 
-async def set_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Botni ishga tushirish"),
-        BotCommand(command="music", description="Musiqa platformasi"),
-        BotCommand(command="video", description="Video xizmatlari"),
-        BotCommand(command="help", description="Yordam"),
-        BotCommand(command="lang", description="Tilni o'zgartirish"),
-        BotCommand(command="stop", description="Jarayonni to'xtatish"),
-    ]
-    await bot.set_my_commands(commands)
+def get_text(user_id):
+    lang = user_langs.get(user_id, "uz")
+    return TEXTS.get(lang, TEXTS["uz"])
+
+
+# ==========================================
+#             YORDAMCHI FUNKSIYALAR
+# ==========================================
+
+def normalize(text):
+    text = unicodedata.normalize("NFKD", text).casefold()
+
+    text = "".join(
+        char for char in text
+        if not unicodedata.combining(char)
+    )
+
+    return re.sub(
+        r"[^a-z0-9а-яё]+",
+        " ",
+        text
+    ).strip()
+
+
+def find_song(query):
+    if not MUSIC_LIBRARY_DIR.exists():
+        return None
+
+    query = normalize(query)
+
+    if not query:
+        return None
+
+    for file in MUSIC_LIBRARY_DIR.rglob("*"):
+        if not file.is_file():
+            continue
+
+        if file.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+
+        filename = normalize(file.stem)
+
+        if query in filename or filename in query:
+            return file
+
+    return None
+
+
+async def send_song(message, title, artist=""):
+    query = f"{artist} {title}".strip()
+
+    file = find_song(query)
+
+    if not file:
+        file = find_song(title)
+
+    if not file:
+        return False
+
+    await message.answer_audio(
+        FSInputFile(file),
+        title=title[:64],
+        performer=artist[:64] if artist else None
+    )
+
+    return True
+
+
+async def run_ffmpeg(args):
+    def execute():
+        subprocess.run(
+            ["ffmpeg", "-y"] + args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=180
+        )
+
+    await asyncio.to_thread(execute)
+
+
+async def delete_message(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+# ==========================================
+#               START VA BUYRUQLAR
+# ==========================================
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    user_mode[user_id] = "video"
-    await message.answer(get_text(user_id, "start"), parse_mode="Markdown")
+async def start(message: types.Message):
+    await message.answer(
+        get_text(message.from_user.id)["start"]
+    )
+
 
 @dp.message(Command("music"))
-async def cmd_music(message: types.Message):
-    user_id = message.from_user.id
-    user_mode[user_id] = "music"
-    await message.answer(get_text(user_id, "music"), parse_mode="Markdown")
+async def music_command(message: types.Message):
+    await message.answer(
+        "🎵 Qo‘shiq nomini yozing yoki ovozli parcha yuboring."
+    )
+
 
 @dp.message(Command("video"))
-async def cmd_video(message: types.Message):
-    user_id = message.from_user.id
-    user_mode[user_id] = "video"
-    await message.answer(get_text(user_id, "video"), parse_mode="Markdown")
+async def video_command(message: types.Message):
+    await message.answer(
+        "🎬 Video havolasini yuboring yoki video fayl jo‘nating."
+    )
+
 
 @dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    user_id = message.from_user.id
-    await message.answer(get_text(user_id, "help"), parse_mode="Markdown")
+async def help_command(message: types.Message):
+    await message.answer(
+        "ℹ️ Yordam:\n\n"
+        "1. Video havolasini yuboring.\n"
+        "2. Qo‘shiq nomini yozing.\n"
+        "3. Ovozli parcha yuboring.\n"
+        "4. Video yuborib dumaloq video oling.\n"
+        "5. /lang orqali tilni o‘zgartiring."
+    )
+
+
+# ==========================================
+#                TIL TANLASH
+# ==========================================
 
 @dp.message(Command("lang"))
-async def cmd_lang(message: types.Message):
-    user_id = message.from_user.id
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang_uz"),
-            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
-            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
-        ]
-    ])
-    await message.answer(get_text(user_id, "lang_select"), reply_markup=keyboard)
+async def language_command(message: types.Message):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🇺🇿 Uzbek",
+                callback_data="lang_uz"
+            ),
+            InlineKeyboardButton(
+                text="🇷🇺 Russian",
+                callback_data="lang_ru"
+            ),
+            InlineKeyboardButton(
+                text="🇬🇧 English",
+                callback_data="lang_en"
+            )
+        ]]
+    )
+
+    await message.answer(
+        get_text(message.from_user.id)["language"],
+        reply_markup=keyboard
+    )
+
 
 @dp.callback_query(F.data.startswith("lang_"))
-async def process_lang(callback: types.CallbackQuery):
-    lang = callback.data.split("_")
-    user_id = callback.from_user.id
-    user_lang[user_id] = lang
-    await callback.message.edit_text(get_text(user_id, "lang_changed"))
+async def language_callback(callback: types.CallbackQuery):
+    lang = callback.data.split("_")[1]
 
-@dp.message(Command("stop"))
-async def cmd_stop(message: types.Message):
-    user_id = message.from_user.id
-    if active_tasks.get(user_id):
-        active_tasks[user_id] = False
-        await message.answer(get_text(user_id, "stop_ok"))
-    else:
-        await message.answer(get_text(user_id, "stop_none"))
-
-def download_video_sync(url: str, base_filename: str):
-    ydl_opts = {
-        'outtmpl': f"{base_filename}.%(ext)s",
-        'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best[ext=mp4]/best',
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
-
-def download_music_sync(query: str, base_filename: str):
-    ydl_opts = {
-        'outtmpl': f"{base_filename}.%(ext)s",
-        'format': 'bestaudio/best',
-        'default_search': 'ytsearch1',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=True)
-        if 'entries' in info:
-            info = info['entries']
-        title = info.get('title', 'Music')
-        artist = info.get('uploader', BOT_USERNAME)
-        return f"{base_filename}.mp3", title, artist
-
-def cleanup_files(pattern: str):
-    for f in glob.glob(f"{pattern}*"):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
-
-@dp.message(F.text)
-async def handle_messages(message: types.Message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    url_match = re.search(r'https?://\S+', text)
-    if url_match:
-        url = url_match.group(0)
-        active_tasks[user_id] = True
-        wait_msg = await message.answer(get_text(user_id, "downloading_video"))
-        base_name = f"vid_{user_id}_{message.message_id}"
-
-        try:
-            filepath = await asyncio.to_thread(download_video_sync, url, base_name)
-            if not active_tasks.get(user_id):
-                cleanup_files(base_name)
-                return
-
-            if os.path.exists(filepath):
-                video_file = FSInputFile(filepath)
-                await message.answer_video(video=video_file, caption=f"✅ {BOT_USERNAME}")
-            else:
-                await message.answer(get_text(user_id, "error"))
-        except Exception as e:
-            logging.error(f"Video yuklash xatosi: {e}")
-            if active_tasks.get(user_id):
-                await message.answer(get_text(user_id, "error"))
-        finally:
-            active_tasks[user_id] = False
-            cleanup_files(base_name)
-            try:
-                await wait_msg.delete()
-            except Exception:
-                pass
+    if lang not in TEXTS:
+        await callback.answer()
         return
 
-    active_tasks[user_id] = True
-    wait_msg = await message.answer(get_text(user_id, "searching_music"))
-    base_name = f"aud_{user_id}_{message.message_id}"
+    user_langs[callback.from_user.id] = lang
+
+    await callback.answer("OK")
+
+    await callback.message.edit_text(
+        TEXTS[lang]["start"]
+    )
+
+
+# ==========================================
+#               DUMALOQ VIDEO
+# ==========================================
+
+async def create_round(message, file_id, prefix):
+    t = get_text(message.from_user.id)
+
+    input_file = f"{prefix}_input.mp4"
+    output_file = f"{prefix}_round.mp4"
+
+    wait = await message.answer(t["wait"])
 
     try:
+        file = await bot.get_file(file_id)
+
+        await bot.download_file(
+            file.file_path,
+            destination=input_file
+        )
+
+        await run_ffmpeg([
+            "-i", input_file,
+            "-t", "60",
+            "-vf",
+            "crop='min(iw,ih)':'min(iw,ih)',scale=384:384",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            output_file
+        ])
+
+        if os.path.exists(output_file):
+            await message.answer_video_note(
+                FSInputFile(output_file)
+            )
+
+    except Exception:
+        logging.exception("Round video error")
+        await message.answer(t["error"])
+
+    finally:
+        await delete_message(wait)
+
+        for file in [input_file, output_file]:
+            if os.path.exists(file):
+                os.remove(file)
+
+
+@dp.message(F.video)
+async def video_message(message: types.Message):
+    await create_round(
+        message,
+        message.video.file_id,
+        f"round_{message.from_user.id}_{message.message_id}"
+    )
+
+
+# ==========================================
+#                 VIDEO YUKLASH
+# ==========================================
+
+def download_video(url, filename):
+    options = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": filename,
+        "max_filesize": MAX_VIDEO_BYTES,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+
+@dp.message(F.text.regexp(r"https?://"))
+async def url_message(message: types.Message):
+    t = get_text(message.from_user.id)
+
+    filename = (
+        f"video_{message.from_user.id}_"
+        f"{message.message_id}.mp4"
+    )
+
+    wait = await message.answer(t["wait"])
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🎵 MP3",
+                callback_data="extract"
+            ),
+            InlineKeyboardButton(
+                text="🎥 Round",
+                callback_data="round"
+            )
+        ]]
+    )
+
+    try:
+        await asyncio.to_thread(
+            download_video,
+            message.text.strip(),
+            filename
+        )
+
+        if os.path.exists(filename):
+            await message.answer_video(
+                FSInputFile(filename),
+                caption="📥 Video tayyor!",
+                reply_markup=keyboard
+            )
+        else:
+            await message.answer(t["error"])
+
+    except Exception:
+        logging.exception("Download error")
+        await message.answer(t["error"])
+
+    finally:
+        await delete_message(wait)
+
+        if os.path.exists(filename):
+            os.remove(filename)
+
+
+# ==========================================
+#                VIDEODAN MP3
+# ==========================================
+
+@dp.callback_query(F.data == "extract")
+async def extract_audio(callback: types.CallbackQuery):
+    await callback.answer()
+
+    if not callback.message.video:
+        return
+
+    input_file = f"extract_{callback.id}.mp4"
+    output_file = f"extract_{callback.id}.mp3"
+
+    try:
+        file = await bot.get_file(
+            callback.message.video.file_id
+        )
+
+        await bot.download_file(
+            file.file_path,
+            destination=input_file
+        )
+
+        await run_ffmpeg([
+            "-i", input_file,
+            "-vn",
+            "-b:a", "192k",
+            output_file
+        ])
+
+        await callback.message.answer_audio(
+            FSInputFile(output_file)
+        )
+
+    except Exception:
+        logging.exception("MP3 extraction error")
+        await callback.message.answer(
+            get_text(callback.from_user.id)["error"]
+        )
+
+    finally:
+        for file in [input_file, output_file]:
+            if os.path.exists(file):
+                os.remove(file)
+
+
+# ==========================================
+#             ROUND TUGMASI
+# ==========================================
+
+@dp.callback_query(F.data == "round")
+async def round_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+    if callback.message.video:
+        await create_round(
+            callback.message,
+            callback.message.video.file_id,
+            f"button_{callback.id}"
+        )
+
+
+# ==========================================
+#            AUDD MUSIQA ANIQLASH
+# ==========================================
+
+async def recognize_music(message, file_id, file_size):
+    t = get_text(message.from_user.id)
+
+    if not AUDD_TOKEN:
+        await message.answer(t["no_audd"])
+        return
+
+    if file_size and file_size > MAX_AUDIO_BYTES:
+        await message.answer("Audio fayl juda katta.")
+        return
+
+    wait = await message.answer(t["recognizing"])
+
+    filename = (
+        f"recognize_{message.from_user.id}_"
+        f"{message.message_id}.audio"
+    )
+
+    try:
+        tg_file = await bot.get_file(file_id)
+
+        await bot.download_file(
+            tg_file.file_path,
+            destination=filename
+        )
+
+        timeout = aiohttp.ClientTimeout(total=60)
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            with open(filename, "rb") as audio:
+                form = aiohttp.FormData()
+
+                form.add_field(
+                    "api_token",
+                    AUDD_TOKEN
+                )
+
+                form.add_field(
+                    "file",
+                    audio,
+                    filename="audio_sample",
+                    content_type="application/octet-stream"
+                )
+
+                async with session.post(
+                    "https://api.audd.io/",
+                    data=form
+                ) as response:
+                    data = await response.json()
+
+        result = data.get("result")
+
+        if data.get("status") != "success" or not result:
+            await message.answer(t["not_found"])
+            return
+
+        title = result.get("title", "Unknown")
+        artist = result.get("artist", "Unknown")
+        album = result.get("album", "")
+
+        sent = await send_song(
+            message,
+            title,
+            artist
+        )
+
+        if sent:
+            return
+
+        link = result.get("song_link", "")
+
+        text = (
+            f"🎵 {title}\n"
+            f"🎤 {artist}\n"
+            f"💿 {album}\n\n"
+            f"{t['not_library']}"
+        )
+
+        if link:
+            text += f"\n{link}"
+
+        await message.answer(text)
+
+    except Exception:
+        logging.exception("Recognition error")
+        await message.answer(t["error"])
+
+    finally:
+        await delete_message(wait)
+
+        if os.path.exists(filename):
+            os.remove(filename)
+
+
+@dp.message(F.voice)
+async def voice_handler(message: types.Message):
+    await recognize_music(
+        message,
+        message.voice.file_id,
+        message.voice.file_size or 0
+    )
+
+
+@dp.message(F.audio)
+async def audio_handler(message: types.Message):
+    await recognize_music(
+        message,
+        message.audio.file_id,
+        message.audio.file_size or 0
+    )
+
+
+# ==========================================
+#          QO'SHIQ NOMI BILAN QIDIRISH
+# ==========================================
+
+@dp.message(F.text)
+async def search_song(message: types.Message):
+    query = message.text.strip()
+
+    if len(query) < 2 or len(query) > 150:
+        return
+
+    t = get_text(message.from_user.id)
+    wait = await message.answer(t["wait"])
+
+    try:
+        file = find_song(query)
+
+        if file:
+            await message.answer_audio(
+                FSInputFile(file)
+            )
+            return
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://itunes.apple.com/search",
+                params={
+                    "term": query,
+                    "entity": "song",
+                    "limit": 5
+                },
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
+                data = await response.json()
+
+        results = data.get("results", [])
+
+        if not results:
+            await message.answer(t["no_song"])
+            return
+
+        song = results[0]
+
+        title = song.get("trackName", query)
+        artist = song.get("artistName", "")
+        link = song.get("trackViewUrl", "")
+
+        sent = await send_song(
+            message,
+            title,
+            artist
+        )
+
+        if not sent:
+            text = (
+                f"🎵 {title}\n"
+                f"🎤 {artist}\n\n"
+                f"{t['not_library']}"
+            )
+
+            if link:
+                text += f"\n{link}"
+
+            await message.answer(text)
+
+    except Exception:
+        logging.exception("Search error")
+        await message.answer(t["error"])
+
+    finally:
+        await delete_message(wait)
+
+
+# ==========================================
+#                 WEB SERVER
+# ==========================================
+
+async def handle(request):
+    return web.Response(
+        text="Axmadov_music_bot is running!"
+    )
+
+
+# ==========================================
+#               BOTNI ISHGA TUSHIRISH
+# ==========================================
+
+async def main():
+    MUSIC_LIBRARY_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    app = web.Application()
+
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
+    await site.start()
+
+    logging.info(
+        "Web server started on port %s",
+        PORT
+    )
+
+    try:
+        await dp.start_polling(bot)
+
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
