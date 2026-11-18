@@ -1,4 +1,3 @@
-aiogram
-yt-dlp
+aiogram>=3.13,<4.0
 aiohttp
-imageio-ffmpeg
+yt-dlp
