@@ -1,817 +1,1025 @@
 
 import os
 import re
-import logging
+import uuid
 import asyncio
+import logging
+import sqlite3
 import tempfile
-import difflib
+import subprocess
 from pathlib import Path
-from collections import defaultdict
+from urllib.parse import urlparse
 
 import aiohttp
 import yt_dlp
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    FSInputFile,
-    ReplyKeyboardRemove
+    FSInputFile
 )
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import CommandStart, Command
+from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-
+from dotenv import load_dotenv
 from aiohttp import web
 
 
-# =====================================================
-# SOZLAMALAR
-# =====================================================
+# =========================
+# CONFIG
+# =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKENINGIZNI_BU_YERGA")
-AUDD_TOKEN = os.getenv("AUDD_TOKEN", "")
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+AUDD_TOKEN = os.getenv("AUDD_TOKEN")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN .env faylida ko'rsatilmagan")
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+VIDEO_DIR = DATA_DIR / "videos"
 MUSIC_DIR = BASE_DIR / "music_library"
 
-MUSIC_EXTENSIONS = {
-    ".mp3", ".m4a", ".ogg", ".flac", ".wav"
-}
+DATA_DIR.mkdir(exist_ok=True)
+VIDEO_DIR.mkdir(exist_ok=True)
+MUSIC_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / "bot.db"
 
 MAX_VIDEO_SIZE = 45 * 1024 * 1024
-MAX_AUDIO_SIZE = 20 * 1024 * 1024
+MAX_VIDEO_DURATION = 60
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 logger = logging.getLogger(__name__)
-
-
-# =====================================================
-# BOT
-# =====================================================
 
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    default=DefaultBotProperties(parse_mode="HTML")
 )
+dp = Dispatcher()
 
-dp = Dispatcher(storage=MemoryStorage())
+# Faqat ochiq, ruxsatli kontent manbalaridan foydalaning.
+ALLOWED_VIDEO_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "m.youtube.com",
+    "instagram.com",
+    "www.instagram.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+    "facebook.com",
+    "www.facebook.com",
+    "fb.watch",
+    "x.com",
+    "www.x.com",
+    "twitter.com",
+    "www.twitter.com"
+}
 
 
-# =====================================================
-# HOLATLAR
-# =====================================================
+# =========================
+# DATABASE
+# =========================
 
-class MusicState(StatesGroup):
-    waiting_for_song = State()
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            language TEXT DEFAULT 'uz'
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS videos (
+            video_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            created_at INTEGER DEFAULT (strftime('%s','now'))
+        )
+    """)
+
+    con.commit()
+    con.close()
 
 
-class LanguageState(StatesGroup):
-    waiting_for_language = State()
+def get_language(user_id):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT language FROM users WHERE user_id=?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else "uz"
 
 
-# =====================================================
-# TILLAR
-# =====================================================
+def set_language(user_id, language):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO users(user_id, language)
+        VALUES (?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET language=excluded.language
+    """, (user_id, language))
+    con.commit()
+    con.close()
 
-LANGUAGES = {
+
+def save_video(video_id, user_id, file_path):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO videos(video_id, user_id, file_path)
+        VALUES (?, ?, ?)
+    """, (video_id, user_id, str(file_path)))
+    con.commit()
+    con.close()
+
+
+def get_video(video_id, user_id):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT file_path FROM videos
+        WHERE video_id=? AND user_id=?
+    """, (video_id, user_id))
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return None
+
+    path = Path(row[0])
+    return path if path.exists() else None
+
+
+def cleanup_old_videos():
+    import time
+
+    cutoff = int(time.time()) - 3600
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT video_id, file_path FROM videos
+        WHERE created_at < ?
+    """, (cutoff,))
+
+    rows = cur.fetchall()
+
+    for video_id, file_path in rows:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Eski video o'chirilmadi")
+
+        cur.execute(
+            "DELETE FROM videos WHERE video_id=?",
+            (video_id,)
+        )
+
+    con.commit()
+    con.close()
+
+
+# =========================
+# TRANSLATIONS
+# =========================
+
+TEXTS = {
     "uz": {
         "welcome": (
-            "👋 Assalomu alaykum!\n\n"
-            "🎵 Qo‘shiq nomini yozing.\n"
-            "🎧 Ovozli parcha yuboring.\n"
-            "🎬 Video havolasini yuboring.\n"
-            "📹 Video yuborsangiz, dumaloq video qilib beraman.\n\n"
-            "/music - Musiqa\n"
-            "/video - Video\n"
-            "/help - Yordam\n"
-            "/lang - Til"
+            "🎵 <b>Universal Music & Video Bot</b>\n\n"
+            "Qo'shiq nomini yozing yoki video havolasini yuboring.\n\n"
+            "🎬 Video yuborsangiz, Round qilaman.\n"
+            "🎵 Audio yuborsangiz, musiqani aniqlashga harakat qilaman."
         ),
-        "ask_music": "🎵 Qo‘shiq nomini yozing.",
-        "searching": "🔎 Musiqa qidirilmoqda...",
-        "not_found": (
-            "😕 Bu qo‘shiq kutubxonadan topilmadi.\n"
-            "Boshqa nom bilan qidirib ko‘ring."
-        ),
-        "choose": "🎵 Topilgan qo‘shiqlardan birini tanlang:",
-        "sending": "⏳ Qo‘shiq yuborilmoqda...",
-        "error": "❌ Xatolik yuz berdi. Birozdan keyin qayta urinib ko‘ring.",
-        "video_help": "🎬 Video havolasini yuboring.",
-        "video_downloading": "⏳ Video yuklanmoqda...",
-        "video_error": "❌ Videoni yuklab bo‘lmadi.",
-        "audio_error": "❌ Ovozli faylni aniqlashda xatolik yuz berdi.",
-        "no_audd": "⚠️ Ovozli qidiruv hozircha sozlanmagan.",
-        "no_match": "😕 Bu qo‘shiq kutubxonangizdan topilmadi.",
-        "recognized": "🎵 Aniqlangan qo‘shiq: ",
-        "language": "🌐 Tilni tanlang:",
-        "language_saved": "✅ Til o‘zgartirildi.",
-        "help": "ℹ️ Bot orqali musiqa qidirishingiz, ovozli parcha yuborishingiz va video olishingiz mumkin."
+        "searching": "🔎 Qidirilmoqda...",
+        "not_found": "❌ Hech narsa topilmadi.",
+        "downloading": "⏳ Video yuklanmoqda...",
+        "video_ready": "🎬 Video tayyor!",
+        "download_error": "❌ Videoni olishning imkoni bo'lmadi.",
+        "round_working": "🔵 Round tayyorlanmoqda...",
+        "music_working": "🎵 Audio ajratilmoqda...",
+        "music_error": "❌ Audio ajratilmadi.",
+        "recognized": "🎧 Aniqlangan musiqa:",
+        "not_recognized": "❌ Musiqa aniqlanmadi.",
+        "choose_language": "Tilni tanlang:",
+        "round_button": "🔵 Round",
+        "music_button": "🎵 Music",
+        "file_too_large": "❌ Video hajmi ruxsat etilgan chegaradan katta.",
+        "video_too_long": "❌ Video 60 soniyadan uzun. Round uchun qisqaroq video yuboring.",
+        "spotify_only": (
+            "Spotify trek ma'lumotlarini ko'rsatadi. "
+            "Audio fayl faqat bot kutubxonasida mavjud va "
+            "tarqatishga ruxsatli bo'lsa yuboriladi."
+        )
     },
     "ru": {
         "welcome": (
-            "👋 Здравствуйте!\n\n"
-            "🎵 Напишите название песни.\n"
-            "🎧 Отправьте голосовой фрагмент.\n"
-            "🎬 Отправьте ссылку на видео.\n"
-            "📹 Отправьте видео, и я сделаю круглое видео.\n\n"
-            "/music - Музыка\n"
-            "/video - Видео\n"
-            "/help - Помощь\n"
-            "/lang - Язык"
+            "🎵 <b>Универсальный Music & Video Bot</b>\n\n"
+            "Напишите название песни или отправьте ссылку на видео."
         ),
-        "ask_music": "🎵 Напишите название песни.",
-        "searching": "🔎 Ищу музыку...",
-        "not_found": "😕 Песня не найдена в библиотеке.",
-        "choose": "🎵 Выберите песню:",
-        "sending": "⏳ Отправляю песню...",
-        "error": "❌ Произошла ошибка. Попробуйте ещё раз.",
-        "video_help": "🎬 Отправьте ссылку на видео.",
-        "video_downloading": "⏳ Загружаю видео...",
-        "video_error": "❌ Не удалось загрузить видео.",
-        "audio_error": "❌ Ошибка распознавания аудио.",
-        "no_audd": "⚠️ Поиск по голосу пока не настроен.",
-        "no_match": "😕 Песня не найдена в библиотеке.",
-        "recognized": "🎵 Найденная песня: ",
-        "language": "🌐 Выберите язык:",
-        "language_saved": "✅ Язык изменён.",
-        "help": "ℹ️ Бот умеет искать музыку, распознавать аудио и обрабатывать видео."
+        "searching": "🔎 Поиск...",
+        "not_found": "❌ Ничего не найдено.",
+        "downloading": "⏳ Загружаю видео...",
+        "video_ready": "🎬 Видео готово!",
+        "download_error": "❌ Не удалось загрузить видео.",
+        "round_working": "🔵 Создаю Round...",
+        "music_working": "🎵 Извлекаю аудио...",
+        "music_error": "❌ Не удалось извлечь аудио.",
+        "recognized": "🎧 Найденная музыка:",
+        "not_recognized": "❌ Музыка не распознана.",
+        "choose_language": "Выберите язык:",
+        "round_button": "🔵 Round",
+        "music_button": "🎵 Music",
+        "file_too_large": "❌ Видео слишком большое.",
+        "video_too_long": "❌ Видео длиннее 60 секунд.",
+        "spotify_only": "Spotify показывает информацию о треках. Аудио отправляется только из разрешённой локальной библиотеки."
     },
     "en": {
         "welcome": (
-            "👋 Hello!\n\n"
-            "🎵 Send a song name.\n"
-            "🎧 Send an audio sample.\n"
-            "🎬 Send a video link.\n"
-            "📹 Send a video to convert it into a round video.\n\n"
-            "/music - Music\n"
-            "/video - Video\n"
-            "/help - Help\n"
-            "/lang - Language"
+            "🎵 <b>Universal Music & Video Bot</b>\n\n"
+            "Send a song name or a video link."
         ),
-        "ask_music": "🎵 Send a song name.",
-        "searching": "🔎 Searching for music...",
-        "not_found": "😕 Song not found in your music library.",
-        "choose": "🎵 Choose a song:",
-        "sending": "⏳ Sending song...",
-        "error": "❌ An error occurred. Please try again.",
-        "video_help": "🎬 Send a video link.",
-        "video_downloading": "⏳ Downloading video...",
-        "video_error": "❌ Could not download the video.",
-        "audio_error": "❌ Audio recognition failed.",
-        "no_audd": "⚠️ Audio recognition is not configured.",
-        "no_match": "😕 Song not found in your library.",
-        "recognized": "🎵 Recognized song: ",
-        "language": "🌐 Choose language:",
-        "language_saved": "✅ Language changed.",
-        "help": "ℹ️ Search music, recognize audio and process videos with this bot."
+        "searching": "🔎 Searching...",
+        "not_found": "❌ Nothing found.",
+        "downloading": "⏳ Downloading video...",
+        "video_ready": "🎬 Video is ready!",
+        "download_error": "❌ Could not download the video.",
+        "round_working": "🔵 Creating round video...",
+        "music_working": "🎵 Extracting audio...",
+        "music_error": "❌ Could not extract audio.",
+        "recognized": "🎧 Recognized music:",
+        "not_recognized": "❌ Music not recognized.",
+        "choose_language": "Choose a language:",
+        "round_button": "🔵 Round",
+        "music_button": "🎵 Music",
+        "file_too_large": "❌ Video file is too large.",
+        "video_too_long": "❌ Video is longer than 60 seconds.",
+        "spotify_only": "Spotify provides track information. Audio is sent only from the licensed local library."
     }
 }
 
-user_languages = defaultdict(lambda: "uz")
 
 def tr(user_id, key):
-    lang = user_languages[user_id]
-    return LANGUAGES.get(lang, LANGUAGES["uz"]).get(
-        key, LANGUAGES["uz"].get(key, "")
+    lang = get_language(user_id)
+    return TEXTS.get(lang, TEXTS["uz"]).get(key, key)
+
+
+# =========================
+# FFMPEG
+# =========================
+
+def run_ffmpeg(args):
+    result = subprocess.run(
+        ["ffmpeg", "-y"] + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180
     )
 
-
-# =====================================================
-# MUSIQA KUTUBXONASI
-# =====================================================
-
-def normalize(text):
-    text = text.lower()
-    text = text.replace("o‘", "o")
-    text = text.replace("g‘", "g")
-    text = text.replace("ʻ", "")
-    text = text.replace("'", "")
-    text = text.replace("’", "")
-    text = text.replace("_", " ")
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def get_music_files():
-    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
-
-    files = []
-
-    for file in MUSIC_DIR.rglob("*"):
-        if file.is_file() and file.suffix.lower() in MUSIC_EXTENSIONS:
-            files.append(file)
-
-    return files
-
-
-def search_songs(query, limit=10):
-    files = get_music_files()
-
-    if not files:
-        logger.warning("music_library papkasida musiqa yo‘q")
-        return []
-
-    query_normalized = normalize(query)
-
-    if not query_normalized:
-        return []
-
-    query_words = set(query_normalized.split())
-    results = []
-
-    for file in files:
-        filename = normalize(file.stem)
-
-        if not filename:
-            continue
-
-        filename_words = set(filename.split())
-
-        common = query_words.intersection(filename_words)
-
-        if query_normalized == filename:
-            score = 1.0
-
-        elif query_normalized in filename:
-            score = 0.95
-
-        elif filename in query_normalized:
-            score = 0.90
-
-        else:
-            word_score = (
-                len(common) / max(len(query_words), 1)
-            )
-
-            similarity = difflib.SequenceMatcher(
-                None,
-                query_normalized,
-                filename
-            ).ratio()
-
-            score = max(word_score, similarity * 0.85)
-
-        if score >= 0.35:
-            results.append((score, file))
-
-    results.sort(key=lambda item: item[0], reverse=True)
-
-    return [file for score, file in results[:limit]]
-
-
-# =====================================================
-# MUSIQA NATIJALARINI SAQLASH
-# =====================================================
-
-music_results = {}
-
-
-def create_music_keyboard(files, user_id):
-    buttons = []
-
-    for index, file in enumerate(files):
-        name = file.stem
-
-        if len(name) > 35:
-            name = name[:32] + "..."
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{index + 1}. {name}",
-                callback_data=f"pick_{index}"
-            )
-        ])
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-# =====================================================
-# START
-# =====================================================
-
-@dp.message(Command("start"))
-async def start_handler(message: Message, state: FSMContext):
-    await state.clear()
-
-    await message.answer(
-        tr(message.from_user.id, "welcome"),
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-
-# =====================================================
-# MUSIC
-# =====================================================
-
-@dp.message(Command("music"))
-async def music_handler(message: Message, state: FSMContext):
-    await state.set_state(MusicState.waiting_for_song)
-
-    await message.answer(
-        tr(message.from_user.id, "ask_music")
-    )
-
-
-@dp.message(MusicState.waiting_for_song, F.text)
-async def music_search_handler(message: Message, state: FSMContext):
-    query = message.text.strip()
-
-    if not query:
-        await message.answer(tr(message.from_user.id, "ask_music"))
-        return
-
-    if query.startswith("/"):
-        return
-
-    status = await message.answer(
-        tr(message.from_user.id, "searching")
-    )
-
-    try:
-        results = await asyncio.to_thread(
-            search_songs,
-            query,
-            10
-        )
-
-        if not results:
-            await status.edit_text(
-                tr(message.from_user.id, "not_found")
-            )
-            await state.clear()
-            return
-
-        music_results[message.from_user.id] = results
-
-        keyboard = create_music_keyboard(
-            results,
-            message.from_user.id
-        )
-
-        await status.edit_text(
-            tr(message.from_user.id, "choose"),
-            reply_markup=keyboard
-        )
-
-        await state.clear()
-
-    except Exception:
-        logger.exception("Musiqa qidirish xatosi")
-
-        await status.edit_text(
-            tr(message.from_user.id, "error")
-        )
-
-        await state.clear()
-
-
-# =====================================================
-# MUSIQA TANLASH
-# =====================================================
-
-@dp.callback_query(F.data.startswith("pick_"))
-async def choose_music_handler(callback: CallbackQuery):
-    try:
-        index = int(callback.data.split("_")[1])
-
-        files = music_results.get(callback.from_user.id, [])
-
-        if index < 0 or index >= len(files):
-            await callback.answer(
-                "Natija eskirgan. Qayta qidiring.",
-                show_alert=True
-            )
-            return
-
-        file_path = files[index]
-
-        if not file_path.exists():
-            await callback.answer(
-                "Fayl topilmadi.",
-                show_alert=True
-            )
-            return
-
-        await callback.answer("Yuborilmoqda...")
-
-        await callback.message.answer(
-            tr(callback.from_user.id, "sending")
-        )
-
-        await callback.message.answer_audio(
-            audio=FSInputFile(file_path),
-            title=file_path.stem
-        )
-
-    except Exception:
-        logger.exception("Musiqa yuborish xatosi")
-
-        await callback.message.answer(
-            tr(callback.from_user.id, "error")
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode(errors="ignore")[-1500:]
         )
 
 
-# =====================================================
-# VIDEO BUYRUG‘I
-# =====================================================
-
-@dp.message(Command("video"))
-async def video_command(message: Message):
-    await message.answer(
-        tr(message.from_user.id, "video_help")
-    )
-
-
-# =====================================================
-# VIDEO HAVOLASINI YUKLASH
-# =====================================================
-
-def download_video(url, folder):
-    output_template = str(Path(folder) / "video.%(ext)s")
-
-    options = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": output_template,
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-        "max_filesize": MAX_VIDEO_SIZE,
-    }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        ydl.download([url])
-
-    files = list(Path(folder).glob("video.*"))
-
-    if not files:
-        raise FileNotFoundError("Yuklangan video topilmadi")
-
-    return files[0]
-
-
-def create_round_video(input_file, output_file):
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i", str(input_file),
+def make_round(input_path, output_path):
+    # Telegram video note uchun kvadrat video.
+    run_ffmpeg([
+        "-i", str(input_path),
+        "-t", str(MAX_VIDEO_DURATION),
         "-vf",
         "scale=640:640:force_original_aspect_ratio=increase,"
-        "crop=640:640,fps=30",
+        "crop=640:640,fps=30,setsar=1",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "28",
         "-c:a", "aac",
         "-b:a", "96k",
-        "-t", "60",
         "-movflags", "+faststart",
-        str(output_file)
-    ]
+        str(output_path)
+    ])
 
-    import subprocess
-
-    subprocess.run(
-        command,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE
-    )
-
-    return output_file
+    if output_path.stat().st_size > MAX_VIDEO_SIZE:
+        raise ValueError("Round video juda katta")
 
 
-@dp.message(F.text.regexp(r"https?://"))
-async def video_link_handler(message: Message):
-    url = message.text.strip()
+def extract_music(input_path, output_path):
+    run_ffmpeg([
+        "-i", str(input_path),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "192k",
+        str(output_path)
+    ])
 
-    status = await message.answer(
-        tr(message.from_user.id, "video_downloading")
-    )
 
+def convert_to_mp4(input_path, output_path):
+    run_ffmpeg([
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "27",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ])
+
+
+# =========================
+# URL VALIDATION
+# =========================
+
+def validate_video_url(url):
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_file = await asyncio.to_thread(
-                download_video,
-                url,
-                temp_dir
-            )
+        parsed = urlparse(url.strip())
 
-            if not video_file.exists():
-                raise FileNotFoundError("Video fayl mavjud emas")
+        if parsed.scheme != "https":
+            return False
 
-            if video_file.stat().st_size > MAX_VIDEO_SIZE:
-                raise ValueError("Video juda katta")
+        host = (parsed.hostname or "").lower()
 
-            round_file = Path(temp_dir) / "round.mp4"
+        if host not in ALLOWED_VIDEO_DOMAINS:
+            return False
 
-            await asyncio.to_thread(
-                create_round_video,
-                video_file,
-                round_file
-            )
+        if parsed.username or parsed.password:
+            return False
 
-            await message.answer_video_note(
-                video_note=FSInputFile(round_file)
-            )
-
-        await status.delete()
+        return True
 
     except Exception:
-        logger.exception("Video havolasini yuklash xatosi")
+        return False
 
-        try:
-            await status.edit_text(
-                tr(message.from_user.id, "video_error")
+
+# =========================
+# SOCIAL VIDEO DOWNLOAD
+# =========================
+
+def download_social_video(url, output_dir):
+    output_dir = Path(output_dir)
+
+    options = {
+        "format": (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]/best"
+        ),
+        "outtmpl": str(output_dir / "download.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "max_filesize": MAX_VIDEO_SIZE,
+        "retries": 2,
+        "overwrites": True,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+    files = list(output_dir.glob("download.*"))
+
+    if not files:
+        raise FileNotFoundError("Video topilmadi")
+
+    mp4_files = [p for p in files if p.suffix.lower() == ".mp4"]
+
+    if mp4_files:
+        video_path = mp4_files[0]
+    else:
+        video_path = files[0]
+        converted = output_dir / "converted.mp4"
+        convert_to_mp4(video_path, converted)
+        video_path = converted
+
+    if video_path.stat().st_size > MAX_VIDEO_SIZE:
+        raise ValueError("Video hajmi juda katta")
+
+    return video_path
+
+
+# =========================
+# SPOTIFY SEARCH
+# =========================
+
+spotify_token = None
+spotify_token_expiry = 0
+
+
+async def get_spotify_token():
+    global spotify_token, spotify_token_expiry
+
+    import time
+
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+
+    if spotify_token and time.time() < spotify_token_expiry:
+        return spotify_token
+
+    auth = aiohttp.BasicAuth(
+        SPOTIFY_CLIENT_ID,
+        SPOTIFY_CLIENT_SECRET
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "client_credentials"},
+            auth=auth,
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as response:
+            if response.status != 200:
+                logger.error("Spotify token error: %s", response.status)
+                return None
+
+            data = await response.json()
+
+    spotify_token = data["access_token"]
+    spotify_token_expiry = time.time() + data.get("expires_in", 3600) - 60
+
+    return spotify_token
+
+
+async def spotify_search(query):
+    token = await get_spotify_token()
+
+    if not token:
+        return []
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    params = {
+        "q": query,
+        "type": "track",
+        "limit": 5
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.spotify.com/v1/search",
+            headers=headers,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as response:
+            if response.status != 200:
+                logger.error("Spotify search error: %s", response.status)
+                return []
+
+            data = await response.json()
+
+    return data.get("tracks", {}).get("items", [])
+
+
+# =========================
+# LOCAL LICENSED MUSIC
+# =========================
+
+def find_local_music(query):
+    query_words = set(re.findall(r"\w+", query.lower()))
+
+    if not query_words:
+        return None
+
+    best_path = None
+    best_score = 0
+
+    for path in MUSIC_DIR.iterdir():
+        if not path.is_file():
+            continue
+
+        if path.suffix.lower() not in {
+            ".mp3", ".m4a", ".ogg", ".wav", ".flac"
+        }:
+            continue
+
+        filename_words = set(
+            re.findall(r"\w+", path.stem.lower())
+        )
+
+        score = len(query_words & filename_words)
+
+        if score > best_score:
+            best_score = score
+            best_path = path
+
+    return best_path if best_score > 0 else None
+
+
+async def send_music_search(message, query):
+    user_id = message.from_user.id
+
+    status = await message.answer(tr(user_id, "searching"))
+
+    local_file = find_local_music(query)
+
+    if local_file:
+        await message.answer_audio(
+            audio=FSInputFile(local_file),
+            caption="🎵 " + local_file.stem
+        )
+
+    tracks = await spotify_search(query)
+
+    if tracks:
+        lines = ["🎧 <b>Spotify natijalari:</b>\n"]
+
+        for i, track in enumerate(tracks, start=1):
+            artists = ", ".join(
+                artist["name"]
+                for artist in track.get("artists", [])
             )
-        except TelegramBadRequest:
-            pass
 
-
-# =====================================================
-# TELEGRAM VIDEOSINI DUMALOQ QILISH
-# =====================================================
-
-@dp.message(F.video)
-async def uploaded_video_handler(message: Message):
-    status = await message.answer("⏳ Video tayyorlanmoqda...")
-
-    try:
-        video = message.video
-
-        if video.file_size and video.file_size > MAX_VIDEO_SIZE:
-            await status.edit_text("❌ Video hajmi juda katta.")
-            return
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_file = Path(temp_dir) / "input.mp4"
-            output_file = Path(temp_dir) / "round.mp4"
-
-            telegram_file = await bot.get_file(video.file_id)
-
-            await bot.download_file(
-                telegram_file.file_path,
-                destination=input_file
+            lines.append(
+                f"{i}. <b>{track.get('name', 'Unknown')}</b>\n"
+                f"👤 {artists}\n"
+                f"💿 {track.get('album', {}).get('name', '')}\n"
+                f"🔗 {track.get('external_urls', {}).get('spotify', '')}\n"
             )
 
-            await asyncio.to_thread(
-                create_round_video,
-                input_file,
-                output_file
-            )
+        lines.append(tr(user_id, "spotify_only"))
 
-            await message.answer_video_note(
-                video_note=FSInputFile(output_file)
-            )
+        await message.answer("\n".join(lines), disable_web_page_preview=True)
 
-        await status.delete()
+    elif not local_file:
+        await message.answer(tr(user_id, "not_found"))
 
-    except Exception:
-        logger.exception("Yuborilgan videoni qayta ishlash xatosi")
-
-        await status.edit_text("❌ Videoni qayta ishlashda xatolik.")
+    await status.delete()
 
 
-# =====================================================
-# OVOZLI XABAR ORQALI QO‘SHIQNI ANIQLASH
-# =====================================================
+# =========================
+# AUDD MUSIC RECOGNITION
+# =========================
 
-async def recognize_audio(file_path):
+async def recognize_music(file_path):
     if not AUDD_TOKEN:
         return None
 
-    timeout = aiohttp.ClientTimeout(total=40)
+    form = aiohttp.FormData()
+    form.add_field("api_token", AUDD_TOKEN)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        with open(file_path, "rb") as audio_file:
-            data = aiohttp.FormData()
+    with open(file_path, "rb") as audio_file:
+        form.add_field(
+            "file",
+            audio_file,
+            filename="audio.mp3",
+            content_type="application/octet-stream"
+        )
 
-            data.add_field("api_token", AUDD_TOKEN)
-            data.add_field("return", "spotify")
-            data.add_field(
-                "file",
-                audio_file,
-                filename="audio.ogg",
-                content_type="application/octet-stream"
-            )
-
+        async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.audd.io/",
-                data=data
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 if response.status != 200:
-                    raise RuntimeError(
-                        f"AudD HTTP xatosi: {response.status}"
-                    )
+                    return None
 
-                result = await response.json()
+                data = await response.json()
 
-    if result.get("status") != "success":
-        return None
-
-    return result.get("result")
+    return data.get("result")
 
 
-async def process_audio(message: Message, file_id: str):
-    if not AUDD_TOKEN:
-        await message.answer(
-            tr(message.from_user.id, "no_audd")
-        )
-        return
+async def download_telegram_file(file_id, output_path):
+    telegram_file = await bot.get_file(file_id)
 
-    status = await message.answer("🎧 Ovoz aniqlanmoqda...")
-
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            audio_path = Path(temp_dir) / "audio.ogg"
-
-            telegram_file = await bot.get_file(file_id)
-
-            if telegram_file.file_size and telegram_file.file_size > MAX_AUDIO_SIZE:
-                await status.edit_text("❌ Audio fayl juda katta.")
-                return
-
-            await bot.download_file(
-                telegram_file.file_path,
-                destination=audio_path
-            )
-
-            result = await recognize_audio(audio_path)
-
-            if not result:
-                await status.edit_text(
-                    tr(message.from_user.id, "not_found")
-                )
-                return
-
-            title = result.get("title", "Noma'lum")
-            artist = result.get("artist", "Noma'lum")
-
-            await status.edit_text(
-                f"🎵 {title}\n"
-                f"👤 {artist}\n\n"
-                f"🔎 Kutubxonadan qidirilmoqda..."
-            )
-
-            query = f"{artist} {title}"
-
-            matches = await asyncio.to_thread(
-                search_songs,
-                query,
-                10
-            )
-
-            if matches:
-                music_results[message.from_user.id] = matches
-
-                keyboard = create_music_keyboard(
-                    matches,
-                    message.from_user.id
-                )
-
-                await message.answer(
-                    "🎵 Aniqlangan qo‘shiq kutubxonadan topildi:",
-                    reply_markup=keyboard
-                )
-            else:
-                await message.answer(
-                    tr(message.from_user.id, "no_match")
-                )
-
-    except Exception:
-        logger.exception("Audio aniqlash xatosi")
-
-        await status.edit_text(
-            tr(message.from_user.id, "audio_error")
-        )
-
-
-@dp.message(F.voice)
-async def voice_handler(message: Message):
-    await process_audio(
-        message,
-        message.voice.file_id
+    await bot.download_file(
+        telegram_file.file_path,
+        destination=output_path
     )
 
 
-@dp.message(F.audio)
-async def audio_handler(message: Message):
-    await process_audio(
-        message,
-        message.audio.file_id
-    )
+# =========================
+# KEYBOARDS
+# =========================
 
-
-# =====================================================
-# TIL O‘ZGARTIRISH
-# =====================================================
-
-@dp.message(Command("lang"))
-async def language_handler(message: Message):
-    keyboard = InlineKeyboardMarkup(
+def video_keyboard(video_id, user_id):
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🇺🇿 O‘zbekcha",
-                    callback_data="lang_uz"
-                )
-            ],
-            [
+                    text=tr(user_id, "round_button"),
+                    callback_data=f"round:{video_id}"
+                ),
                 InlineKeyboardButton(
-                    text="🇷🇺 Русский",
-                    callback_data="lang_ru"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇬🇧 English",
-                    callback_data="lang_en"
+                    text=tr(user_id, "music_button"),
+                    callback_data=f"music:{video_id}"
                 )
             ]
         ]
     )
 
+
+def language_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🇺🇿 O'zbekcha",
+                    callback_data="lang:uz"
+                ),
+                InlineKeyboardButton(
+                    text="🇷🇺 Русский",
+                    callback_data="lang:ru"
+                ),
+                InlineKeyboardButton(
+                    text="🇬🇧 English",
+                    callback_data="lang:en"
+                )
+            ]
+        ]
+    )
+
+
+# =========================
+# START / HELP / LANGUAGE
+# =========================
+
+@dp.message(CommandStart())
+async def start_handler(message: Message):
+    init_db()
+
+    user_id = message.from_user.id
+
     await message.answer(
-        tr(message.from_user.id, "language"),
-        reply_markup=keyboard
+        tr(user_id, "welcome"),
+        reply_markup=language_keyboard()
     )
 
-
-@dp.callback_query(F.data.startswith("lang_"))
-async def language_callback(callback: CallbackQuery):
-    lang = callback.data.replace("lang_", "")
-
-    if lang in LANGUAGES:
-        user_languages[callback.from_user.id] = lang
-
-    await callback.answer()
-
-    await callback.message.edit_text(
-        tr(callback.from_user.id, "language_saved")
-    )
-
-
-# =====================================================
-# HELP
-# =====================================================
 
 @dp.message(Command("help"))
 async def help_handler(message: Message):
     await message.answer(
-        tr(message.from_user.id, "help")
+        "🎵 Qo'shiq nomini yozing — musiqa qidiriladi.\n"
+        "🎬 Video havolasini yuboring — oddiy video qaytadi.\n"
+        "🔵 Round tugmasi — dumaloq video.\n"
+        "🎵 Music tugmasi — videodan audio.\n"
+        "🎧 Audio yuboring — musiqa aniqlanadi.\n"
+        "/language — tilni o'zgartirish."
     )
 
 
-# =====================================================
-# BEGONA MATNLAR
-# =====================================================
+@dp.message(Command("language"))
+async def language_handler(message: Message):
+    await message.answer(
+        "Tilni tanlang:",
+        reply_markup=language_keyboard()
+    )
+
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def language_callback(callback: CallbackQuery):
+    language = callback.data.split(":")[1]
+
+    if language not in {"uz", "ru", "en"}:
+        await callback.answer()
+        return
+
+    set_language(callback.from_user.id, language)
+
+    await callback.answer("Language updated!")
+
+    try:
+        await callback.message.edit_text(
+            tr(callback.from_user.id, "welcome")
+        )
+    except TelegramBadRequest:
+        pass
+
+
+# =========================
+# SOCIAL VIDEO URL HANDLER
+# IMPORTANT: before general text handler
+# =========================
 
 @dp.message(F.text)
-async def unknown_text_handler(message: Message):
-    await message.answer(
-        "❓ Tushunmadim.\n"
-        "/music - musiqa qidirish\n"
-        "/video - video\n"
-        "/help - yordam"
+async def text_handler(message: Message):
+    text = (message.text or "").strip()
+    user_id = message.from_user.id
+
+    if text.startswith("/"):
+        return
+
+    # URL bo'lsa, avval xavfsizligini tekshiramiz.
+    if text.lower().startswith(("https://", "http://")):
+        if not validate_video_url(text):
+            await message.answer(
+                "❌ Bu havola qo'llab-quvvatlanmaydi. "
+                "Faqat ruxsatli ochiq video havolalarini yuboring."
+            )
+            return
+
+        status = await message.answer(tr(user_id, "downloading"))
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path = await asyncio.to_thread(
+                    download_social_video,
+                    text,
+                    temp_dir
+                )
+
+                # Vaqtinchalik papka o'chib ketmasligi uchun
+                # videoni doimiy katalogga nusxalaymiz.
+                video_id = uuid.uuid4().hex[:12]
+                saved_path = VIDEO_DIR / f"{video_id}.mp4"
+
+                import shutil
+                shutil.copy2(video_path, saved_path)
+
+            if saved_path.stat().st_size > MAX_VIDEO_SIZE:
+                saved_path.unlink(missing_ok=True)
+                raise ValueError("Video juda katta")
+
+            save_video(video_id, user_id, saved_path)
+
+            await message.answer_video(
+                video=FSInputFile(saved_path),
+                caption=tr(user_id, "video_ready"),
+                supports_streaming=True,
+                reply_markup=video_keyboard(video_id, user_id)
+            )
+
+            await status.delete()
+
+        except Exception:
+            logger.exception("Video download error")
+
+            await status.edit_text(
+                tr(user_id, "download_error")
+            )
+
+        return
+
+    # URL bo'lmasa, musiqa qidiriladi.
+    await send_music_search(message, text)
+
+
+# =========================
+# ROUND BUTTON
+# =========================
+
+@dp.callback_query(F.data.startswith("round:"))
+async def round_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    video_id = callback.data.split(":", 1)[1]
+
+    source = get_video(video_id, user_id)
+
+    if not source:
+        await callback.answer(
+            "Video topilmadi yoki muddati tugagan.",
+            show_alert=True
+        )
+        return
+
+    await callback.answer(tr(user_id, "round_working"))
+
+    output_path = VIDEO_DIR / f"{video_id}_round.mp4"
+
+    status = await callback.message.answer(
+        tr(user_id, "round_working")
     )
 
+    try:
+        await asyncio.to_thread(
+            make_round,
+            source,
+            output_path
+        )
 
-# =====================================================
-# XATOLARNI LOGGA YOZISH
-# =====================================================
+        await callback.message.answer_video_note(
+            video_note=FSInputFile(output_path)
+        )
 
-@dp.error()
-async def global_error_handler(event, exception):
-    logger.exception(
-        "Kutilmagan bot xatosi",
-        exc_info=exception
+    except Exception:
+        logger.exception("Round conversion error")
+        await callback.message.answer(
+            "❌ Round tayyorlashda xatolik yuz berdi."
+        )
+
+    finally:
+        output_path.unlink(missing_ok=True)
+
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+
+
+# =========================
+# MUSIC BUTTON
+# =========================
+
+@dp.callback_query(F.data.startswith("music:"))
+async def music_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    video_id = callback.data.split(":", 1)[1]
+
+    source = get_video(video_id, user_id)
+
+    if not source:
+        await callback.answer(
+            "Video topilmadi yoki muddati tugagan.",
+            show_alert=True
+        )
+        return
+
+    await callback.answer(tr(user_id, "music_working"))
+
+    output_path = VIDEO_DIR / f"{video_id}_audio.mp3"
+
+    status = await callback.message.answer(
+        tr(user_id, "music_working")
     )
 
-    return True
+    try:
+        await asyncio.to_thread(
+            extract_music,
+            source,
+            output_path
+        )
+
+        await callback.message.answer_audio(
+            audio=FSInputFile(output_path),
+            title="Extracted audio",
+            caption="🎵 Video audiosi"
+        )
+
+    except Exception:
+        logger.exception("Audio extraction error")
+        await callback.message.answer(tr(user_id, "music_error"))
+
+    finally:
+        output_path.unlink(missing_ok=True)
+
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
 
 
-# =====================================================
-# WEB SERVER (RENDER UCHUN)
-# =====================================================
+# =========================
+# DIRECT TELEGRAM VIDEO
+# Automatically converts to round
+# =========================
+
+@dp.message(F.video)
+async def telegram_video_handler(message: Message):
+    user_id = message.from_user.id
+
+    video = message.video
+
+    if video.file_size and video.file_size > MAX_VIDEO_SIZE:
+        await message.answer(tr(user_id, "file_too_large"))
+        return
+
+    if video.duration and video.duration > MAX_VIDEO_DURATION:
+        await message.answer(tr(user_id, "video_too_long"))
+        return
+
+    status = await message.answer(
+        tr(user_id, "round_working")
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source = Path(temp_dir) / "input.mp4"
+        output = Path(temp_dir) / "round.mp4"
+
+        try:
+            await download_telegram_file(
+                video.file_id,
+                source
+            )
+
+            await asyncio.to_thread(
+                make_round,
+                source,
+                output
+            )
+
+            await message.answer_video_note(
+                video_note=FSInputFile(output)
+            )
+
+        except Exception:
+            logger.exception("Telegram video conversion error")
+
+            await message.answer(
+                "❌ Videoni Round formatiga aylantirib bo'lmadi."
+            )
+
+        finally:
+            try:
+                await status.delete()
+            except TelegramBadRequest:
+                pass
+
+
+# =========================
+# AUDIO / VOICE RECOGNITION
+# =========================
+
+@dp.message(F.audio | F.voice)
+async def audio_handler(message: Message):
+    user_id = message.from_user.id
+
+    audio = message.audio or message.voice
+
+    if audio.file_size and audio.file_size > 20 * 1024 * 1024:
+        await message.answer(
+            "❌ Audio fayl juda katta."
+        )
+        return
+
+    status = await message.answer(
+        "🎧 Musiqa aniqlanmoqda..."
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        audio_path = Path(temp_dir) / "audio.bin"
+
+        try:
+            await download_telegram_file(
+                audio.file_id,
+                audio_path
+            )
+
+            result = await recognize_music(audio_path)
+
+            if not result:
+                await message.answer(
+                    tr(user_id, "not_recognized")
+                )
+            else:
+                title = result.get("title", "Unknown")
+                artist = result.get("artist", "Unknown")
+                album = result.get("album", "Unknown")
+                spotify_url = (
+                    result.get("song_link")
+                    or result.get("spotify", {}).get("external_urls", {}).get("spotify")
+                )
+
+                response = (
+                    f"{tr(user_id, 'recognized')}\n\n"
+                    f"🎵 <b>{title}</b>\n"
+                    f"👤 {artist}\n"
+                    f"💿 {album}"
+                )
+
+                if spotify_url:
+                    response += f"\n🔗 {spotify_url}"
+
+                await message.answer(response)
+
+        except Exception:
+            logger.exception("AudD recognition error")
+            await message.answer(
+                "❌ Audioni aniqlashda xatolik yuz berdi."
+            )
+
+        finally:
+            try:
+                await status.delete()
+            except TelegramBadRequest:
+                pass
+
+
+# =========================
+# HEALTH CHECK FOR RENDER
+# =========================
 
 async def health(request):
     return web.Response(text="Bot is running!")
 
 
-async def start_web_server():
+async def start_health_server():
     app = web.Application()
     app.router.add_get("/", health)
+    app.router.add_get("/health", health)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -826,30 +1034,34 @@ async def start_web_server():
 
     await site.start()
 
-    logger.info("Web server ishga tushdi: %s", port)
+    logger.info("Health server started on port %s", port)
+
+    return runner
 
 
-# =====================================================
+# =========================
 # MAIN
-# =====================================================
+# =========================
 
 async def main():
-    if BOT_TOKEN == "BOT_TOKENINGIZNI_BU_YERGA":
-        raise RuntimeError(
-            "BOT_TOKEN ni kiriting yoki BOT_TOKEN environment variable yarating."
+    init_db()
+
+    runner = await start_health_server()
+
+    try:
+        logger.info("Bot started")
+
+        await bot.delete_webhook(drop_pending_updates=True)
+
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types()
         )
 
-    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Bot ishga tushmoqda...")
-
-    await start_web_server()
-
-    await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot to‘xtatildi.")
+    asyncio.run(main())
