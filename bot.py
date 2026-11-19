@@ -19,17 +19,11 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# Tokenni Render Environment'dan yoki shu yerdan oladi
+# Tokenni Render Environment Variables'dan yoki shu yerdan oladi
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_BOT_TOKENINGIZ").strip()
 BOT_USERNAME = "@Axmadov_music_bot"
 
-if not BOT_TOKEN or BOT_TOKEN == "SIZNING_BOT_TOKENINGIZ":
-    logging.error("XATO: BOT_TOKEN kiritilmagan! Tokenni kodga yoki Render Environment'ga qo'ying.")
-    sys.exit(1)
-
-bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
 user_lang = {}
 user_mode = {}
 active_tasks = {}
@@ -97,6 +91,9 @@ async def set_bot_commands(bot: Bot):
     ]
     await bot.set_my_commands(commands)
 
+# ==========================================
+# BUYRUQLAR HANDLERLARI
+# ==========================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -134,10 +131,11 @@ async def cmd_lang(message: types.Message):
 
 @dp.callback_query(F.data.startswith("lang_"))
 async def process_lang(callback: types.CallbackQuery):
-    lang = callback.data.split("_")
+    lang = callback.data.split("_")[1]
     user_id = callback.from_user.id
     user_lang[user_id] = lang
     await callback.message.edit_text(get_text(user_id, "lang_changed"))
+    await callback.answer()
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
@@ -148,6 +146,9 @@ async def cmd_stop(message: types.Message):
     else:
         await message.answer(get_text(user_id, "stop_none"))
 
+# ==========================================
+# YUKLASH FUNKSIYALARI (YT-DLP)
+# ==========================================
 def download_video_sync(url: str, base_filename: str):
     ydl_opts = {
         'outtmpl': f"{base_filename}.%(ext)s",
@@ -176,8 +177,8 @@ def download_music_sync(query: str, base_filename: str):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=True)
-        if 'entries' in info:
-            info = info['entries']
+        if 'entries' in info and info['entries']:
+            info = info['entries'][0]
         title = info.get('title', 'Music')
         artist = info.get('uploader', BOT_USERNAME)
         return f"{base_filename}.mp3", title, artist
@@ -189,11 +190,15 @@ def cleanup_files(pattern: str):
         except Exception:
             pass
 
+# ==========================================
+# XABARLARNI QAYTA ISHLASH
+# ==========================================
 @dp.message(F.text)
 async def handle_messages(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
 
+    # Havola yuborilganda -> Video yuklash
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         url = url_match.group(0)
@@ -223,10 +228,3 @@ async def handle_messages(message: types.Message):
                 await wait_msg.delete()
             except Exception:
                 pass
-        return
-
-    active_tasks[user_id] = True
-    wait_msg = await message.answer(get_text(user_id, "searching_music"))
-    base_name = f"aud_{user_id}_{message.message_id}"
-
-    try:
