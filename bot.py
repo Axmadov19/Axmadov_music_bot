@@ -19,8 +19,8 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# Tokenni Render Environment Variables'dan yoki shu yerdan oladi
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_BOT_TOKENINGIZ").strip()
+# Tokenni Render Environment Variables'dan oladi
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BOT_USERNAME = "@Axmadov_music_bot"
 
 dp = Dispatcher()
@@ -44,7 +44,8 @@ TEXTS = {
         "downloading_video": "⏳ Video yuklanmoqda, biroz kuting...",
         "searching_music": "🔎 Musiqa qidirilmoqda va yuklanmoqda...",
         "error": "❌ Xatolik yuz berdi. Havola noto'g'ri, profil yopiq yoki fayl hajmi 50MB dan katta.",
-        "not_found": "❌ Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring."
+        "not_found": "❌ Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring.",
+        "too_large": "⚠️ Kechirasiz, fayl hajmi 50MB dan katta. Telegram cheklovi sababli yuborib bo'lmaydi."
     },
     "ru": {
         "start": "👋 Здравствуйте! Добро пожаловать в бот.\n\n📥 **Скачать видео:** Отправьте ссылку из Instagram, TikTok или YouTube.\n🎵 **Скачать музыку:** Напишите название песни или имя исполнителя.",
@@ -58,7 +59,8 @@ TEXTS = {
         "downloading_video": "⏳ Видео загружается, пожалуйста подождите...",
         "searching_music": "🔎 Поиск и загрузка музыки...",
         "error": "❌ Произошла ошибка. Неверная ссылка, закрытый аккаунт или файл больше 50МБ.",
-        "not_found": "❌ Ничего не найдено. Попробуйте другое название."
+        "not_found": "❌ Ничего не найдено. Попробуйте другое название.",
+        "too_large": "⚠️ Извините, размер файла превышает 50МБ. Невозможно отправить из-за ограничений Telegram."
     },
     "en": {
         "start": "👋 Hello! Welcome to the bot.\n\n📥 **Download Video:** Send an Instagram, TikTok, or YouTube link.\n🎵 **Download Music:** Type a song title or artist name.",
@@ -72,13 +74,14 @@ TEXTS = {
         "downloading_video": "⏳ Downloading video, please wait...",
         "searching_music": "🔎 Searching and downloading music...",
         "error": "❌ An error occurred. Invalid link, private account, or file exceeds 50MB.",
-        "not_found": "❌ Nothing found. Try another search query."
+        "not_found": "❌ Nothing found. Try another search query.",
+        "too_large": "⚠️ Sorry, the file size exceeds 50MB. Cannot send due to Telegram limits."
     }
 }
 
 def get_text(user_id: int, key: str) -> str:
     lang = user_lang.get(user_id, "uz")
-    return TEXTS[lang][key]
+    return TEXTS.get(lang, TEXTS["uz"]).get(key, "")
 
 async def set_bot_commands(bot: Bot):
     commands = [
@@ -177,7 +180,9 @@ def download_music_sync(query: str, base_filename: str):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=True)
-        if 'entries' in info and info['entries']:
+        if 'entries' in info:
+            if not info['entries']:
+                return None, None, None
             info = info['entries'][0]
         title = info.get('title', 'Music')
         artist = info.get('uploader', BOT_USERNAME)
@@ -190,6 +195,12 @@ def cleanup_files(pattern: str):
         except Exception:
             pass
 
+def is_file_within_limit(filepath: str, limit_mb: int = 50) -> bool:
+    if not os.path.exists(filepath):
+        return False
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    return size_mb <= limit_mb
+
 # ==========================================
 # XABARLARNI QAYTA ISHLASH
 # ==========================================
@@ -198,7 +209,7 @@ async def handle_messages(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # Havola yuborilganda -> Video yuklash
+    # 1. Havola yuborilganda -> Video yuklash
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         url = url_match.group(0)
@@ -209,22 +220,33 @@ async def handle_messages(message: types.Message):
         try:
             filepath = await asyncio.to_thread(download_video_sync, url, base_name)
             if not active_tasks.get(user_id):
-                cleanup_files(base_name)
                 return
 
             if os.path.exists(filepath):
-                video_file = FSInputFile(filepath)
-                await message.answer_video(video=video_file, caption=f"✅ {BOT_USERNAME}")
-            else:
-                await message.answer(get_text(user_id, "error"))
-        except Exception as e:
-            logging.error(f"Video yuklash xatosi: {e}")
-            if active_tasks.get(user_id):
-                await message.answer(get_text(user_id, "error"))
-        finally:
-            active_tasks[user_id] = False
-            cleanup_files(base_name)
-            try:
-                await wait_msg.delete()
-            except Exception:
-                pass
+                if is_file_within_limit(filepath):
+async def health_check(request):
+return web.Response(text="Bot is running!")
+async def start_web_server():
+app = web.Application()
+app.router.add_get("/", health_check)
+runner = web.AppRunner(app)
+await runner.setup()
+port = int(os.environ.get("PORT", 8080))
+site = web.TCPSite(runner, "0.0.0.0", port)
+await site.start()
+logging.info(f"Web server {port}-portda ishga tushdi.")
+async def main():
+if not BOT_TOKEN:
+logging.error("XATO: BOT_TOKEN kiritilmagan! Render Environment Variables'ga BOT_TOKEN qo'shing.")
+return
+bot = Bot(token=BOT_TOKEN)
+await set_bot_commands(bot)
+await start_web_server()
+logging.info("Bot polling rejimida ishga tushdi...")
+await bot.delete_webhook(drop_pending_updates=True)
+await dp.start_polling(bot)
+if name == "main":
+try:
+asyncio.run(main())
+except (KeyboardInterrupt, SystemExit):
+logging.info("Bot to'xtatildi.")
